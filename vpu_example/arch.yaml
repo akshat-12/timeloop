@@ -1,0 +1,66 @@
+architecture:
+  version: 0.4
+  nodes:
+  - !Container
+    name: system
+    attributes: {technology: "45nm", global_cycle_seconds: 1e-9}
+  - !Component
+    name: DRAM
+    class: DRAM
+    attributes:
+      depth: 1024
+      width: 16
+      datawidth: 16
+      block_size: 1
+      read_bandwidth: 4
+      write_bandwidth: 4
+  - !Component
+    name: shared_buffer
+    class: SRAM
+    attributes:
+      depth: 64
+      width: 16
+      datawidth: 16
+      block_size: 1
+      read_bandwidth: 4
+      write_bandwidth: 4
+  - !Component
+    name: VPU
+    class: compute
+    subclass: vpu
+    attributes:
+      instances: 1
+      connected_buffer: "shared_buffer"
+      backing_storage: "DRAM"
+      vector_width: 4
+      operations:
+        add: {latency: 1}
+        sub: {latency: 1}
+        mul: {latency: 2}
+        relu: {latency: 2}
+        sigmoid: {latency: 8}
+        tanh: {latency: 8}
+        softmax: {latency: 16}
+  - !Container
+    name: PE
+  - !Component
+    name: mac
+    class: intmac
+    attributes:
+      width: 16
+      datawidth: 16
+
+# VPU timing is native; energy/area are placeholders at this stage.
+compound_components:
+  version: 0.4
+  classes:
+  - name: vpu
+    attributes:
+      vector_width: must_specify
+      operations: must_specify
+    subcomponents: []
+    actions:
+    - name: compute
+      subcomponents: []
+    - name: leak
+      subcomponents: []
