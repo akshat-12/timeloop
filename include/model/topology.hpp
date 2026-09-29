@@ -39,6 +39,7 @@ algorithmic contributors may be used tactual or promote products derived
 #include "mapping/mapping.hpp"
 #include "model/level.hpp"
 #include "model/arithmetic.hpp"
+#include "model/vpu.hpp"
 #include "model/buffer.hpp"
 #include "compound-config/compound-config.hpp"
 #include "network.hpp"
@@ -127,6 +128,9 @@ class Topology : public Module
     unsigned arithmetic_map;
 
    public:
+    // Optional shared compute unit, outside the MAC/storage hierarchy.
+    std::shared_ptr<VPU::Specs> vpu;
+
     // Constructors and assignment operators.
     Specs() = default;
     ~Specs() = default;
@@ -143,6 +147,7 @@ class Topology : public Module
       for (auto& network_p: other.networks)
         networks.push_back(network_p->Clone());
 
+      if (other.vpu) vpu = std::make_shared<VPU::Specs>(*other.vpu);
       storage_map = other.storage_map;
       arithmetic_map = other.arithmetic_map;
     }
@@ -151,6 +156,7 @@ class Topology : public Module
     friend void swap(Specs& first, Specs& second)
     {
       using std::swap;
+      swap(first.vpu, second.vpu);
       swap(first.levels, second.levels);
       swap(first.inferred_networks, second.inferred_networks);
       swap(first.networks, second.networks);
@@ -230,6 +236,7 @@ class Topology : public Module
 
  private:
   std::vector<std::shared_ptr<Level>> levels_;
+  std::shared_ptr<VPU> vpu_; // Not evaluated until explicit VPU scheduling is added.
   std::map<std::string, std::shared_ptr<Network>> networks_;
 
   // Maps to store the binding relationship between architectural tiling level
@@ -307,6 +314,7 @@ class Topology : public Module
     for (auto& network_kv: other.networks_)
       networks_[network_kv.first] = network_kv.second->Clone();
 
+    if (other.vpu_) vpu_ = std::make_shared<VPU>(*other.vpu_);
     tile_area_ = other.tile_area_;
     specs_ = other.specs_;
     stats_ = other.stats_;
@@ -318,6 +326,7 @@ class Topology : public Module
     using std::swap;
     swap(first.is_specced_, second.is_specced_);
     swap(first.is_evaluated_, second.is_evaluated_);
+    swap(first.vpu_, second.vpu_);
     swap(first.levels_, second.levels_);
     swap(first.networks_, second.networks_);
     swap(first.tile_area_, second.tile_area_);
@@ -329,6 +338,7 @@ class Topology : public Module
   std::shared_ptr<const BufferLevel> ViewStorageLevel(const unsigned& storage_level_id) const;
   std::shared_ptr<const BufferLevel> ViewStorageLevel(const std::string& level_name) const;
   std::shared_ptr<const ArithmeticUnits> ViewArithmeticLevel() const;
+  std::shared_ptr<const VPU> ViewVPU() const { return vpu_; }
 
   Topology& operator = (Topology other)
   {

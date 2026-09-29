@@ -172,6 +172,7 @@ model/model-base.cpp
 model/engine.cpp
 model/level.cpp
 model/arithmetic.cpp
+model/vpu.cpp
 model/buffer.cpp
 model/topology.cpp
 model/network.cpp

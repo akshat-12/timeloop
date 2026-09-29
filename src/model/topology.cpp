@@ -739,6 +739,7 @@ void  Topology::OutputOrojenesisMappingYAML(Mapping& mapping, std::string map_ya
 void Topology::Spec(const Topology::Specs& specs)
 {
   specs_ = specs;
+  vpu_ = specs_.vpu ? std::make_shared<VPU>(*specs_.vpu) : nullptr;
 
   for (auto& level : levels_)
   {
@@ -1103,13 +1104,21 @@ Topology::Specs Topology::ParseTreeSpecs(config::CompoundConfigNode designRoot, 
 
       for (int c = 0; c < curLocal.getLength() ; c++)
       {
-        std::string cName, cClass;
+        std::string cName, cClass, cSubclass;
         curLocal[c].lookupValue("name", cName);
         curLocal[c].lookupValue("class", cClass);
+        curLocal[c].lookupValue("subclass", cSubclass);
         std::uint64_t localElementSize = config::parseElementSize(cName);
         std::uint64_t nElements = multiplication * localElementSize;
 
-        if (isBufferClass(cClass))
+        // Handle VPU before generic compute so it cannot replace the MAC.
+        if (cClass == "vpu" || cSubclass == "vpu")
+        {
+          if (nElements != 1 || specs.vpu)
+            throw std::invalid_argument("Architecture supports exactly one shared VPU");
+          specs.vpu = std::make_shared<VPU::Specs>(VPU::ParseSpecs(curLocal[c]));
+        }
+        else if (isBufferClass(cClass))
         {
           // Create a buffer spec.
           auto level_specs_p = std::make_shared<BufferLevel::Specs>(BufferLevel::ParseSpecs(curLocal[c], nElements, is_sparse_topology));
