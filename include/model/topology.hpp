@@ -39,6 +39,7 @@ algorithmic contributors may be used tactual or promote products derived
 #include "mapping/mapping.hpp"
 #include "model/level.hpp"
 #include "model/arithmetic.hpp"
+// Akshat: Make VPU types available to topology.
 #include "model/vpu.hpp"
 #include "model/buffer.hpp"
 #include "compound-config/compound-config.hpp"
@@ -129,6 +130,7 @@ class Topology : public Module
 
    public:
     // Optional shared compute unit, outside the MAC/storage hierarchy.
+    // Akshat: Optional VPU specs are separate from the MAC/storage hierarchy.
     std::shared_ptr<VPU::Specs> vpu;
 
     // Constructors and assignment operators.
@@ -147,6 +149,7 @@ class Topology : public Module
       for (auto& network_p: other.networks)
         networks.push_back(network_p->Clone());
 
+      // Akshat: Deep-copy optional specs instead of sharing mutable state.
       if (other.vpu) vpu = std::make_shared<VPU::Specs>(*other.vpu);
       storage_map = other.storage_map;
       arithmetic_map = other.arithmetic_map;
@@ -156,6 +159,7 @@ class Topology : public Module
     friend void swap(Specs& first, Specs& second)
     {
       using std::swap;
+      // Akshat: Preserve VPU specs during copy-and-swap assignment.
       swap(first.vpu, second.vpu);
       swap(first.levels, second.levels);
       swap(first.inferred_networks, second.inferred_networks);
@@ -200,12 +204,14 @@ class Topology : public Module
   //
   struct Stats
   {
+    // Akshat: Serial phase totals plus tile geometry for the connected VPU workload.
     struct VPUTiming {
       bool active = false;
       std::uint64_t tiles = 0, elements = 0;
       std::uint64_t prefetch = 0, producer_read = 0, producer_compute = 0, producer_write = 0;
       std::uint64_t read = 0, compute = 0, drain = 0, total = 0;
     } vpu;
+    // Akshat: Keep the original overlapped MAC/memory estimate for comparison only.
     std::uint64_t base_cycles = 0;
     double energy;
     double area;
@@ -226,6 +232,7 @@ class Topology : public Module
 
     void Reset()
     {
+      // Akshat: Clear VPU totals and baseline cycles for every candidate evaluation.
       vpu = VPUTiming{};
       base_cycles = 0;
       energy = 0;
@@ -245,7 +252,8 @@ class Topology : public Module
 
  private:
   std::vector<std::shared_ptr<Level>> levels_;
-  std::shared_ptr<VPU> vpu_; // Not evaluated until explicit VPU scheduling is added.
+  // Akshat: Own the shared VPU without changing storage-level indices.
+  std::shared_ptr<VPU> vpu_; // Akshat: Evaluated only when the workload requests a VPU stage.
   std::map<std::string, std::shared_ptr<Network>> networks_;
 
   // Maps to store the binding relationship between architectural tiling level
@@ -323,6 +331,7 @@ class Topology : public Module
     for (auto& network_kv: other.networks_)
       networks_[network_kv.first] = network_kv.second->Clone();
 
+    // Akshat: Copy the VPU object when copying a topology.
     if (other.vpu_) vpu_ = std::make_shared<VPU>(*other.vpu_);
     tile_area_ = other.tile_area_;
     specs_ = other.specs_;
@@ -335,6 +344,7 @@ class Topology : public Module
     using std::swap;
     swap(first.is_specced_, second.is_specced_);
     swap(first.is_evaluated_, second.is_evaluated_);
+    // Akshat: Include the VPU in topology assignment.
     swap(first.vpu_, second.vpu_);
     swap(first.levels_, second.levels_);
     swap(first.networks_, second.networks_);
@@ -347,6 +357,7 @@ class Topology : public Module
   std::shared_ptr<const BufferLevel> ViewStorageLevel(const unsigned& storage_level_id) const;
   std::shared_ptr<const BufferLevel> ViewStorageLevel(const std::string& level_name) const;
   std::shared_ptr<const ArithmeticUnits> ViewArithmeticLevel() const;
+  // Akshat: Read-only accessor for registration tests and inspection.
   std::shared_ptr<const VPU> ViewVPU() const { return vpu_; }
 
   Topology& operator = (Topology other)
@@ -362,6 +373,7 @@ class Topology : public Module
   static Specs ParseTreeSpecs(config::CompoundConfigNode designRoot, bool is_sparse_topology);
 
   void Spec(const Specs& specs);
+  // Akshat: Validate complete output tiles and account for the serial connected flow.
   void EvaluateVPU(const Mapping& mapping);
   void Reset();
   unsigned NumLevels() const;

@@ -128,6 +128,7 @@ std::string ShapeFileName(const std::string shape_name)
 
 void ParseWorkload(config::CompoundConfigNode config, Workload& workload)
 {
+  // Akshat: Parse/reset the optional VPU request; validate required fields and vector length.
   workload.vpu_stages.clear();
   if (config.exists("vpu_stages")) {
     auto stages = config.lookup("vpu_stages");

@@ -1,3 +1,4 @@
+// Akshat: VPU implementation: parse attributes and estimate vector-batch cycles.
 #include "model/vpu.hpp"
 
 #include <limits>
@@ -7,12 +8,14 @@ namespace model
 {
 namespace
 {
+// Akshat: Translate YAML operation strings into enum values.
 const std::map<std::string, VPU::VPUOp> operation_names
     = { { "add", VPU::VPUOp::ADD },        { "sub", VPU::VPUOp::SUB },
         { "mul", VPU::VPUOp::MUL },        { "relu", VPU::VPUOp::RELU },
         { "tanh", VPU::VPUOp::TANH },      { "sigmoid", VPU::VPUOp::SIGMOID },
         { "softmax", VPU::VPUOp::SOFTMAX } };
 
+// Akshat: Reject missing, zero, or negative timing/width parameters.
 std::uint64_t
 Positive(config::CompoundConfigNode node, const char* key)
 {
@@ -23,6 +26,7 @@ Positive(config::CompoundConfigNode node, const char* key)
   return static_cast<std::uint64_t>(value);
 }
 
+// Akshat: Validate directly constructed specs as well as parsed YAML specs.
 void
 Validate(const VPU::Specs& specs)
 {
@@ -44,12 +48,14 @@ Validate(const VPU::Specs& specs)
 }
 } // namespace
 
+// Akshat: Expose operation lookup to workload-to-VPU integration.
 VPU::VPUOp VPU::ParseOperation(const std::string& name) {
   auto it = operation_names.find(name);
   if (it == operation_names.end()) throw std::invalid_argument("Unknown VPU operation: " + name);
   return it->second;
 }
 
+// Akshat: Read the component attributes and per-operation timing table.
 VPU::Specs
 VPU::ParseSpecs(config::CompoundConfigNode setting)
 {
@@ -97,6 +103,7 @@ VPU::ParseSpecs(config::CompoundConfigNode setting)
   return specs;
 }
 
+// Akshat: Create a configured but unevaluated compute unit.
 VPU::VPU(const Specs& specs) : specs_(specs)
 {
   Validate(specs_);
@@ -104,6 +111,7 @@ VPU::VPU(const Specs& specs) : specs_(specs)
   is_evaluated_ = false;
 }
 
+// Akshat: Reset per-piece statistics, round up batches, and charge latency + (batches-1)*II.
 EvalStatus
 VPU::Evaluate(VPUOp operation, std::uint64_t count)
 {
@@ -139,6 +147,7 @@ VPU::Evaluate(VPUOp operation, std::uint64_t count)
   return { true, "" };
 }
 
+// Akshat: Support independent topology copies and basic Level statistics accessors.
 std::shared_ptr<Level>
 VPU::Clone() const
 {
@@ -159,6 +168,7 @@ VPU::UtilizedInstances(problem::Shape::DataSpaceID) const
 {
   return stats_.scalar_operations.Get() == 0 ? 0 : 1;
 }
+// Akshat: Print standalone compute statistics; connected phase totals are printed by topology.
 void
 VPU::Print(std::ostream& out) const
 {
@@ -171,6 +181,7 @@ VPU::Print(std::ostream& out) const
       << "  Energy, area, and memory transfers are not modeled.\n";
 }
 
+// Akshat: Reject generic tile evaluation: it contains no explicit VPU operation request.
 // A generic MAC tile does not identify the VPU operation. Fail explicitly
 // until topology integration calls the operation-specific Evaluate overload
 // above.

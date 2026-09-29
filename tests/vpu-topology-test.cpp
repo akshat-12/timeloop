@@ -1,3 +1,4 @@
+// Akshat: Registration regression test: VPU coexists with MAC and survives copying.
 // Run with a processed native architecture YAML containing a VPU and a problem.
 #include "model/topology.hpp"
 #include <cassert>

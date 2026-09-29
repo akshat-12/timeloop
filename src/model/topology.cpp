@@ -395,6 +395,7 @@ std::ostream& operator << (std::ostream& out, const Topology& topology)
     level_id++;
   }
 
+  // Akshat: Print connected phase totals and distinguish baseline timing/energy from serial timing.
   if (topology.stats_.vpu.active) {
     const auto& v = topology.stats_.vpu;
     out << "VPU serial flow: MAC -> shared buffer -> VPU -> DRAM\n"
@@ -758,6 +759,7 @@ void  Topology::OutputOrojenesisMappingYAML(Mapping& mapping, std::string map_ya
 void Topology::Spec(const Topology::Specs& specs)
 {
   specs_ = specs;
+  // Akshat: Construct or clear the optional VPU when the architecture is specified.
   vpu_ = specs_.vpu ? std::make_shared<VPU>(*specs_.vpu) : nullptr;
 
   for (auto& level : levels_)
@@ -1123,6 +1125,7 @@ Topology::Specs Topology::ParseTreeSpecs(config::CompoundConfigNode designRoot, 
 
       for (int c = 0; c < curLocal.getLength() ; c++)
       {
+        // Akshat: Read subclass so class=compute, subclass=vpu is recognized separately from MAC.
         std::string cName, cClass, cSubclass;
         curLocal[c].lookupValue("name", cName);
         curLocal[c].lookupValue("class", cClass);
@@ -1130,6 +1133,7 @@ Topology::Specs Topology::ParseTreeSpecs(config::CompoundConfigNode designRoot, 
         std::uint64_t localElementSize = config::parseElementSize(cName);
         std::uint64_t nElements = multiplication * localElementSize;
 
+        // Akshat: Register one shared VPU before generic compute handling; do not replace arithmetic_map.
         // Handle VPU before generic compute so it cannot replace the MAC.
         if (cClass == "vpu" || cSubclass == "vpu")
         {
@@ -1589,6 +1593,7 @@ std::vector<EvalStatus> Topology::Evaluate(Mapping& mapping,
       break;
   }
 
+  // Akshat: Run VPU accounting only after a successful MAC mapping; surface validation failures.
   if (success_accum && !workload->vpu_stages.empty()) {
     try {
       if (analysis->IsLayoutInitialized())
@@ -1614,10 +1619,12 @@ std::vector<EvalStatus> Topology::Evaluate(Mapping& mapping,
   return eval_status;
 }
 
+// Akshat: Connected execution entry point; all following phases are sequential.
 // Serial tile model. No instruction scheduler, overlap, or intermediate DRAM pass.
 void Topology::EvaluateVPU(const Mapping& mapping)
 {
   using U = std::uint64_t;
+  // Akshat: Checked cycle arithmetic prevents silent unsigned overflow.
   auto add = [](U a, U b) {
     if (b > std::numeric_limits<U>::max() - a) throw std::overflow_error("VPU cycle overflow");
     return a + b;
@@ -1630,6 +1637,7 @@ void Topology::EvaluateVPU(const Mapping& mapping)
       throw std::overflow_error("VPU transfer overflow");
     return static_cast<U>(cycles);
   };
+  // Akshat: Validate the requested unit, operation, and writable output tensor.
   if (!vpu_ || !specs_.vpu) throw std::invalid_argument("VPU stage requires a VPU architecture component");
   const auto& stage = workload_->vpu_stages.at(0);
   if (stage.unit != vpu_->Name()) throw std::invalid_argument("Unknown VPU stage unit");
@@ -1645,6 +1653,7 @@ void Topology::EvaluateVPU(const Mapping& mapping)
   if (named == shape->DataSpaceNameToID.end() || !shape->IsReadWriteDataSpace.at(named->second))
     throw std::invalid_argument("VPU output must be the writable MAC result");
   auto pv = named->second;
+  // Akshat: Resolve named memory connections and require a direct shared-buffer/DRAM boundary.
   unsigned buffer_id = 0;
   while (buffer_id < NumStorageLevels() && specs_.GetStorageLevel(buffer_id)->name.Get() != specs_.vpu->connected_buffer) ++buffer_id;
   if (buffer_id + 2 != NumStorageLevels() ||
@@ -1662,6 +1671,7 @@ void Topology::EvaluateVPU(const Mapping& mapping)
   if (buffer->is_sparse_module.Get() || dram->is_sparse_module.Get() ||
       buffer->word_bits.Get() != dram->word_bits.Get())
     throw std::invalid_argument("VPU requires dense memories with equal word widths");
+  // Akshat: Use directional bandwidth capped by any shared-port bandwidth.
   auto rate = [](const BufferLevel::Specs& memory, bool read) {
     const auto& directional = read ? memory.read_bandwidth : memory.write_bandwidth;
     double value = directional.IsSpecified() ? directional.Get() : 0;
@@ -1669,6 +1679,7 @@ void Topology::EvaluateVPU(const Mapping& mapping)
       value = value > 0 ? std::min(value, memory.shared_bandwidth.Get()) : memory.shared_bandwidth.Get();
     return value;
   };
+  // Akshat: Derive completed output geometry from the mapping, not from VPU vector width.
   // A producer piece is the output region inside the shared-buffer boundary.
   std::set<unsigned> output_dims;
   unsigned last_dim = 0;
@@ -1681,6 +1692,7 @@ void Topology::EvaluateVPU(const Mapping& mapping)
   }
   if (output_dims.empty()) throw std::invalid_argument("VPU requires non-scalar output");
   std::vector<U> extents(shape->NumFlattenedDimensions, 1);
+  // Akshat: Reject partial reductions outside the shared buffer and unsupported loop tiles.
   auto boundary = mapping.loop_nest.storage_tiling_boundaries.at(buffer_id);
   for (unsigned i = 0; i < mapping.loop_nest.loops.size(); ++i) {
     const auto& loop = mapping.loop_nest.loops[i];
@@ -1693,6 +1705,7 @@ void Topology::EvaluateVPU(const Mapping& mapping)
     } else if (loop.end > 1 && (!output_dims.count(loop.dimension) || loop::IsSpatial(loop.spacetime_dimension)))
       throw std::invalid_argument("VPU requires complete reductions inside the shared buffer and temporal outer tiles");
   }
+  // Akshat: Compute per-piece and full output footprints from loop extents.
   problem::OperationPoint low, high, full_high;
   for (unsigned d = 0; d < extents.size(); ++d) {
     low[d] = 0; high[d] = extents[d]-1; full_high[d] = workload_->GetFlattenedBound(d)-1;
@@ -1704,6 +1717,7 @@ void Topology::EvaluateVPU(const Mapping& mapping)
   if (!v.elements || outputs % v.elements || extents[last_dim] % stage.vector_length)
     throw std::invalid_argument("VPU vectors must fit entirely within completed output tiles");
   v.tiles = outputs / v.elements;
+  // Akshat: Reuse producer traffic totals and ensure the final DRAM output write occurs once.
   const auto& bs = GetStorageLevel(buffer_id)->GetStats();
   const auto& ds = GetStorageLevel(buffer_id+1)->GetStats();
   if (ds.reads.at(pv) != 0 || ds.updates.at(pv) != outputs)
@@ -1715,8 +1729,10 @@ void Topology::EvaluateVPU(const Mapping& mapping)
   }
   U producer = GetArithmeticLevel()->Cycles();
   for (unsigned i = 0; i < buffer_id; ++i) producer = std::max(producer, GetStorageLevel(i)->Cycles());
+  // Akshat: Evaluate one representative piece; all accepted pieces have identical output sizes.
   auto status = vpu_->Evaluate(op, v.elements / stage.vector_length);
   if (!status.success) throw std::invalid_argument(status.fail_reason);
+  // Akshat: Distribute aggregate producer counts evenly; this is an analytical approximation.
   // Aggregate producer costs are divided evenly across pieces, preserving totals.
   // This is a conservative analytical estimate, not an exact MAC event trace.
   for (U tile = 0; tile < v.tiles; ++tile) {
@@ -1725,11 +1741,14 @@ void Topology::EvaluateVPU(const Mapping& mapping)
     v.producer_read = add(v.producer_read, transfer(share(reads), rate(*buffer,true)));
     v.producer_compute = add(v.producer_compute, share(producer));
     v.producer_write = add(v.producer_write, transfer(share(writes), rate(*buffer,false)));
+    // Akshat: Charge the shared-buffer-to-VPU read followed by VPU batch computation.
     v.read = add(v.read, transfer(v.elements, rate(*buffer,true)));
     v.compute = add(v.compute, vpu_->Cycles());
+    // Akshat: Write VPU results directly to DRAM without shared-buffer write-back or duplicate drain.
     // Direct VPU -> DRAM: original final output write is moved, not duplicated.
     v.drain = add(v.drain, transfer(v.elements, rate(*dram,false)));
   }
+  // Akshat: Sum the serial phases and mark this timing result active.
   for (U phase : {v.prefetch,v.producer_read,v.producer_compute,v.producer_write,v.read,v.compute,v.drain})
     v.total = add(v.total, phase);
   v.active = true;
@@ -1768,6 +1787,7 @@ void Topology::ComputeStats(bool eval_success)
     }
 
     // Max cycle plus network fill and drain latency
+    // Akshat: Replace baseline cycles with serial phase totals when active; add network latency once.
     stats_.base_cycles = cycles + total_network_latency_;
     stats_.cycles = (stats_.vpu.active ? stats_.vpu.total : cycles) + total_network_latency_;
 

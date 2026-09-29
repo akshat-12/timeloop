@@ -61,6 +61,7 @@ const Shape* GetShape();
 class Workload
 {
  public:
+  // Akshat: Workload extension: one operation request on the completed MAC output tensor.
   // One optional in-place operation on a completed MAC output tile.
   struct VPUStage {
     std::string unit, operation, output;

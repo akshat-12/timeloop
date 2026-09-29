@@ -130,6 +130,7 @@ if not os.path.isdir('../src/pat'):
 
 # Build the model library.
     
+# Akshat: model/vpu.cpp below adds VPU timing to both model and mapper native builds.
 common_sources = Split("""
 einsum-graph/einsum-graph.cpp
 isl-wrapper/ctx-manager.cpp
