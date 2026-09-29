@@ -28,6 +28,9 @@
 #include <cassert>
 #include <string>
 #include <stdexcept>
+#include <cmath>
+#include <limits>
+#include <set>
 
 #include "model/topology.hpp"
 #include "model/network-legacy.hpp"
@@ -392,6 +395,22 @@ std::ostream& operator << (std::ostream& out, const Topology& topology)
     level_id++;
   }
 
+  if (topology.stats_.vpu.active) {
+    const auto& v = topology.stats_.vpu;
+    out << "VPU serial flow: MAC -> shared buffer -> VPU -> DRAM\n"
+        << "  Completed tiles: " << v.tiles << "\n"
+        << "  Output elements per tile: " << v.elements << "\n"
+        << "  Input prefetch cycles: " << v.prefetch << "\n"
+        << "  Producer buffer read cycles: " << v.producer_read << "\n"
+        << "  Producer compute cycles: " << v.producer_compute << "\n"
+        << "  Producer buffer write cycles: " << v.producer_write << "\n"
+        << "  VPU buffer read cycles: " << v.read << "\n"
+        << "  VPU compute cycles: " << v.compute << "\n"
+        << "  Final DRAM write cycles: " << v.drain << "\n"
+        << "  Serial total before network latency: " << v.total << "\n"
+        << "  Original MAC/memory cycles (reference only): " << topology.stats_.base_cycles << "\n"
+        << "  Energy excludes VPU/extra reads; original memory energy and leakage retained.\n";
+  }
   out << "Networks" << std::endl;
   out << "--------" << std::endl;
 
@@ -1570,6 +1589,18 @@ std::vector<EvalStatus> Topology::Evaluate(Mapping& mapping,
       break;
   }
 
+  if (success_accum && !workload->vpu_stages.empty()) {
+    try {
+      if (analysis->IsLayoutInitialized())
+        throw std::invalid_argument("VPU serial model requires bandwidth-based memory evaluation");
+      EvaluateVPU(mapping);
+    }
+    catch (const std::exception& e) {
+      success_accum = false;
+      eval_status.at(specs_.ArithmeticMap()) = {false, e.what()};
+    }
+  }
+
   if (!break_on_failure || success_accum)
   {
     ComputeStats(success_accum);
@@ -1581,6 +1612,127 @@ std::vector<EvalStatus> Topology::Evaluate(Mapping& mapping,
   }
 
   return eval_status;
+}
+
+// Serial tile model. No instruction scheduler, overlap, or intermediate DRAM pass.
+void Topology::EvaluateVPU(const Mapping& mapping)
+{
+  using U = std::uint64_t;
+  auto add = [](U a, U b) {
+    if (b > std::numeric_limits<U>::max() - a) throw std::overflow_error("VPU cycle overflow");
+    return a + b;
+  };
+  auto transfer = [](U words, double bandwidth) -> U {
+    if (!std::isfinite(bandwidth) || bandwidth <= 0)
+      throw std::invalid_argument("VPU requires explicit positive memory bandwidths");
+    long double cycles = std::ceil(static_cast<long double>(words) / bandwidth);
+    if (cycles >= static_cast<long double>(std::numeric_limits<U>::max()))
+      throw std::overflow_error("VPU transfer overflow");
+    return static_cast<U>(cycles);
+  };
+  if (!vpu_ || !specs_.vpu) throw std::invalid_argument("VPU stage requires a VPU architecture component");
+  const auto& stage = workload_->vpu_stages.at(0);
+  if (stage.unit != vpu_->Name()) throw std::invalid_argument("Unknown VPU stage unit");
+  auto op = VPU::ParseOperation(stage.operation);
+  // Independent binary operands need a tensor input description in a later step.
+  if (op == VPU::VPUOp::ADD || op == VPU::VPUOp::SUB || op == VPU::VPUOp::MUL)
+    throw std::invalid_argument("Connected VPU currently supports unary activations only");
+  if (op != VPU::VPUOp::SOFTMAX && stage.vector_length != 1)
+    throw std::invalid_argument("Only softmax accepts vector_length");
+  const auto* shape = workload_->GetShape();
+  if (shape->UsesFlattening) throw std::invalid_argument("VPU requires an unflattened dense problem");
+  auto named = shape->DataSpaceNameToID.find(stage.output);
+  if (named == shape->DataSpaceNameToID.end() || !shape->IsReadWriteDataSpace.at(named->second))
+    throw std::invalid_argument("VPU output must be the writable MAC result");
+  auto pv = named->second;
+  unsigned buffer_id = 0;
+  while (buffer_id < NumStorageLevels() && specs_.GetStorageLevel(buffer_id)->name.Get() != specs_.vpu->connected_buffer) ++buffer_id;
+  if (buffer_id + 2 != NumStorageLevels() ||
+      specs_.GetStorageLevel(NumStorageLevels()-1)->name.Get() != specs_.vpu->backing_storage)
+    throw std::invalid_argument("VPU shared buffer must be immediately below the named outermost memory");
+  auto buffer = specs_.GetStorageLevel(buffer_id);
+  auto dram = specs_.GetStorageLevel(buffer_id+1);
+  auto masks = tiling::TransposeMasks(mapping.datatype_bypass_nest, workload_);
+  for (unsigned d = 0; d < shape->NumDataSpaces; ++d) {
+    if (!masks.at(buffer_id).at(d) || !masks.at(buffer_id+1).at(d))
+      throw std::invalid_argument("VPU requires all tensors kept in shared buffer and DRAM");
+    if (d != pv && shape->IsReadWriteDataSpace.at(d))
+      throw std::invalid_argument("VPU supports one writable tensor");
+  }
+  if (buffer->is_sparse_module.Get() || dram->is_sparse_module.Get() ||
+      buffer->word_bits.Get() != dram->word_bits.Get())
+    throw std::invalid_argument("VPU requires dense memories with equal word widths");
+  auto rate = [](const BufferLevel::Specs& memory, bool read) {
+    const auto& directional = read ? memory.read_bandwidth : memory.write_bandwidth;
+    double value = directional.IsSpecified() ? directional.Get() : 0;
+    if (memory.shared_bandwidth.IsSpecified() && memory.shared_bandwidth.Get() > 0)
+      value = value > 0 ? std::min(value, memory.shared_bandwidth.Get()) : memory.shared_bandwidth.Get();
+    return value;
+  };
+  // A producer piece is the output region inside the shared-buffer boundary.
+  std::set<unsigned> output_dims;
+  unsigned last_dim = 0;
+  for (const auto& projection : shape->Projections.at(pv)) {
+    if (projection.size() != 1 ||
+        (projection.front().first != shape->NumCoefficients && workload_->GetCoefficient(projection.front().first) != 1))
+      throw std::invalid_argument("VPU requires simple unit-coefficient output dimensions");
+    last_dim = shape->FactorizedToFlattened.at(projection.front().second);
+    if (!output_dims.insert(last_dim).second) throw std::invalid_argument("Repeated output dimension");
+  }
+  if (output_dims.empty()) throw std::invalid_argument("VPU requires non-scalar output");
+  std::vector<U> extents(shape->NumFlattenedDimensions, 1);
+  auto boundary = mapping.loop_nest.storage_tiling_boundaries.at(buffer_id);
+  for (unsigned i = 0; i < mapping.loop_nest.loops.size(); ++i) {
+    const auto& loop = mapping.loop_nest.loops[i];
+    if (loop.start != 0 || loop.stride != 1 || loop.end <= 0 || loop.residual_end != loop.end)
+      throw std::invalid_argument("VPU requires perfect unit-stride tiles");
+    if (i <= boundary) {
+      if (extents[loop.dimension] > std::numeric_limits<U>::max() / loop.end)
+        throw std::overflow_error("VPU tile overflow");
+      extents[loop.dimension] *= loop.end;
+    } else if (loop.end > 1 && (!output_dims.count(loop.dimension) || loop::IsSpatial(loop.spacetime_dimension)))
+      throw std::invalid_argument("VPU requires complete reductions inside the shared buffer and temporal outer tiles");
+  }
+  problem::OperationPoint low, high, full_high;
+  for (unsigned d = 0; d < extents.size(); ++d) {
+    low[d] = 0; high[d] = extents[d]-1; full_high[d] = workload_->GetFlattenedBound(d)-1;
+  }
+  problem::OperationSpace piece(workload_, low, high), full(workload_, low, full_high);
+  auto& v = stats_.vpu;
+  v.elements = piece.GetSize(pv);
+  U outputs = full.GetSize(pv);
+  if (!v.elements || outputs % v.elements || extents[last_dim] % stage.vector_length)
+    throw std::invalid_argument("VPU vectors must fit entirely within completed output tiles");
+  v.tiles = outputs / v.elements;
+  const auto& bs = GetStorageLevel(buffer_id)->GetStats();
+  const auto& ds = GetStorageLevel(buffer_id+1)->GetStats();
+  if (ds.reads.at(pv) != 0 || ds.updates.at(pv) != outputs)
+    throw std::invalid_argument("VPU requires one final output write and no DRAM partial-sum reads");
+  U input_words = 0, reads = 0, writes = 0;
+  for (unsigned d = 0; d < shape->NumDataSpaces; ++d) {
+    if (d != pv) input_words = add(input_words, ds.reads.at(d));
+    reads = add(reads, bs.reads.at(d)); writes = add(writes, bs.updates.at(d));
+  }
+  U producer = GetArithmeticLevel()->Cycles();
+  for (unsigned i = 0; i < buffer_id; ++i) producer = std::max(producer, GetStorageLevel(i)->Cycles());
+  auto status = vpu_->Evaluate(op, v.elements / stage.vector_length);
+  if (!status.success) throw std::invalid_argument(status.fail_reason);
+  // Aggregate producer costs are divided evenly across pieces, preserving totals.
+  // This is a conservative analytical estimate, not an exact MAC event trace.
+  for (U tile = 0; tile < v.tiles; ++tile) {
+    auto share = [&](U total) { return total / v.tiles + (tile < total % v.tiles); };
+    v.prefetch = add(v.prefetch, transfer(share(input_words), std::min(rate(*dram,true),rate(*buffer,false))));
+    v.producer_read = add(v.producer_read, transfer(share(reads), rate(*buffer,true)));
+    v.producer_compute = add(v.producer_compute, share(producer));
+    v.producer_write = add(v.producer_write, transfer(share(writes), rate(*buffer,false)));
+    v.read = add(v.read, transfer(v.elements, rate(*buffer,true)));
+    v.compute = add(v.compute, vpu_->Cycles());
+    // Direct VPU -> DRAM: original final output write is moved, not duplicated.
+    v.drain = add(v.drain, transfer(v.elements, rate(*dram,false)));
+  }
+  for (U phase : {v.prefetch,v.producer_read,v.producer_compute,v.producer_write,v.read,v.compute,v.drain})
+    v.total = add(v.total, phase);
+  v.active = true;
 }
 
 void Topology::ComputeStats(bool eval_success)
@@ -1616,7 +1768,8 @@ void Topology::ComputeStats(bool eval_success)
     }
 
     // Max cycle plus network fill and drain latency
-    stats_.cycles = cycles + total_network_latency_;
+    stats_.base_cycles = cycles + total_network_latency_;
+    stats_.cycles = (stats_.vpu.active ? stats_.vpu.total : cycles) + total_network_latency_;
 
     // Utilization.
     // FIXME.

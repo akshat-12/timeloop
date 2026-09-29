@@ -25,6 +25,7 @@ class VPU : public Level {
     Attribute<std::string> name = std::string("VPU");
     Attribute<std::uint64_t> instances = std::uint64_t(1);
     Attribute<std::uint64_t> vector_width;
+    std::string connected_buffer = "shared_buffer", backing_storage = "DRAM";
     // Each supported operation has its own timing parameters.
     std::map<VPUOp, OperationSpec> operations;
     };
@@ -38,6 +39,7 @@ class VPU : public Level {
 
     explicit VPU(const Specs& specs);
     static Specs ParseSpecs(config::CompoundConfigNode setting);
+    static VPUOp ParseOperation(const std::string& name);
 
     // Evaluate one piece, replacing the previous statistics (not accumulating).
     // count means independent invocations: elements for elementwise operations,

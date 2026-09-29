@@ -44,6 +44,12 @@ Validate(const VPU::Specs& specs)
 }
 } // namespace
 
+VPU::VPUOp VPU::ParseOperation(const std::string& name) {
+  auto it = operation_names.find(name);
+  if (it == operation_names.end()) throw std::invalid_argument("Unknown VPU operation: " + name);
+  return it->second;
+}
+
 VPU::Specs
 VPU::ParseSpecs(config::CompoundConfigNode setting)
 {
@@ -58,6 +64,8 @@ VPU::ParseSpecs(config::CompoundConfigNode setting)
   if (attributes.exists("instances"))
     specs.instances = Positive(attributes, "instances");
 
+  attributes.lookupValue("connected_buffer", specs.connected_buffer);
+  attributes.lookupValue("backing_storage", specs.backing_storage);
   specs.vector_width = Positive(attributes, "vector_width");
   if (!attributes.exists("operations"))
     throw std::invalid_argument("VPU requires an operations mapping");

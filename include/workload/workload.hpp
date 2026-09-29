@@ -61,6 +61,12 @@ const Shape* GetShape();
 class Workload
 {
  public:
+  // One optional in-place operation on a completed MAC output tile.
+  struct VPUStage {
+    std::string unit, operation, output;
+    std::uint64_t vector_length = 1;
+  };
+  std::vector<VPUStage> vpu_stages;
   typedef std::map<Shape::FactorizedDimensionID, Coordinate> FactorizedBounds;
   typedef std::map<Shape::FlattenedDimensionID, Coordinate> FlattenedBounds;
   typedef std::map<Shape::CoefficientID, int> Coefficients;

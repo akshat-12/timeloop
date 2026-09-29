@@ -200,6 +200,13 @@ class Topology : public Module
   //
   struct Stats
   {
+    struct VPUTiming {
+      bool active = false;
+      std::uint64_t tiles = 0, elements = 0;
+      std::uint64_t prefetch = 0, producer_read = 0, producer_compute = 0, producer_write = 0;
+      std::uint64_t read = 0, compute = 0, drain = 0, total = 0;
+    } vpu;
+    std::uint64_t base_cycles = 0;
     double energy;
     double area;
     std::uint64_t cycles;
@@ -219,6 +226,8 @@ class Topology : public Module
 
     void Reset()
     {
+      vpu = VPUTiming{};
+      base_cycles = 0;
       energy = 0;
       area = 0;
       cycles = 0;
@@ -353,6 +362,7 @@ class Topology : public Module
   static Specs ParseTreeSpecs(config::CompoundConfigNode designRoot, bool is_sparse_topology);
 
   void Spec(const Specs& specs);
+  void EvaluateVPU(const Mapping& mapping);
   void Reset();
   unsigned NumLevels() const;
   unsigned NumStorageLevels() const;
