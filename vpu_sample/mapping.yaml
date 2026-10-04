@@ -1,0 +1,30 @@
+# Temporal AND spatial factors multiply to M=4, N=4, K=4.
+# Permutations list loops from inner to outer.
+mapping:
+- target: DRAM
+  type: temporal
+  factors: [M=2, N=1, K=1]
+  permutation: [K, N, M]
+- target: DRAM
+  type: dataspace
+  keep: [A, B, C]
+  bypass: []
+- target: shared_buffer
+  type: temporal
+  factors: [M=1, N=2, K=4]
+  permutation: [K, N, M]
+- target: shared_buffer
+  type: dataspace
+  keep: [A, B, C]
+  bypass: []
+# One buffer piece contains A[2,4], B[4,4], C[2,4]: 32 words total.
+# K is entirely inside the buffer tile, so its 8 outputs finish accumulating
+# before the outer M loop advances to the next piece.
+# The connected VPU now applies ReLU to each completed C[2,4] piece.
+# Keep DRAM K=1: splitting K here would send incomplete sums to the VPU.
+# Distribute the output tile over the 2x2 MAC array inside shared_buffer.
+- target: PE
+  type: spatial
+  factors: [M=2, N=2, K=1]
+  permutation: [M, N, K]
+  split: 1

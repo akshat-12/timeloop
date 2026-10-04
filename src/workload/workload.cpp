@@ -128,6 +128,34 @@ std::string ShapeFileName(const std::string shape_name)
 
 void ParseWorkload(config::CompoundConfigNode config, Workload& workload)
 {
+  // Keep the workload declaration separate from hardware latency parameters.
+  workload.vpu_stage = Workload::VPUStage{};
+  if (config.exists("vpu_stages"))
+  {
+    auto stages = config.lookup("vpu_stages");
+    if (!stages.isList() || stages.getLength() > 1)
+      throw std::invalid_argument("Support at most one VPU stage");
+    if (stages.getLength() == 1)
+    {
+      auto node = stages[0];
+      auto& stage = workload.vpu_stage;
+      stage.enabled = true;
+      if (!node.lookupValue("unit", stage.unit) ||
+          !node.lookupValue("operation", stage.operation) ||
+          !node.lookupValue("output", stage.output))
+        throw std::invalid_argument("VPU stage requires unit, operation, output");
+      stage.has_scalar = node.lookupValue("scalar", stage.scalar);
+      unsigned long long length = 1;
+      if (node.exists("vector_length"))
+      {
+        long long signed_length = 0;
+        if (!node.lookupValue("vector_length", signed_length) || signed_length <= 0)
+          throw std::invalid_argument("VPU vector_length must be positive");
+        length = signed_length;
+      }
+      stage.vector_length = length;
+    }
+  }
   std::string shape_name;
   if (!config.exists("shape"))
   {

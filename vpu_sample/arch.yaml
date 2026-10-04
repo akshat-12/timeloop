@@ -1,0 +1,75 @@
+architecture:
+  version: 0.4
+  nodes:
+  - !Container
+    name: system
+    attributes: {technology: "45nm", global_cycle_seconds: 1e-9}
+  - !Component
+    name: DRAM
+    class: DRAM
+    attributes:
+      depth: 1024
+      width: 16
+      datawidth: 16
+      block_size: 1
+      read_bandwidth: 4
+      write_bandwidth: 4
+  - !Component
+    name: shared_buffer
+    class: SRAM
+    attributes:
+      depth: 64
+      width: 16
+      datawidth: 16
+      block_size: 1
+      read_bandwidth: 4
+      write_bandwidth: 4
+  - !Component
+    # One VPU, independently configurable final-output input/output routes.
+    name: VPU
+    class: compute
+    subclass: vpu
+    attributes:
+      instances: 1
+      input_width: 4
+      input_source: "shared_buffer" # "pe" selects a direct PE-to-VPU link.
+      output_destination: "shared_buffer" # "dram" skips the final buffer round trip.
+      connected_buffer: "shared_buffer"
+      backing_storage: "DRAM"
+      buffer_slots: 2
+      # Latency per batch of up to input_width elements; batches are serial.
+      operations:
+        add: {latency: 1}
+        sub: {latency: 1}
+        mul: {latency: 2}
+        relu: {latency: 8}
+        sigmoid: {latency: 16}
+        tanh: {latency: 16}
+        softmax: {latency: 32}
+  - !Container
+    name: PE
+    # 2x2 MAC array; Timeloop models mapped compute, not systolic wavefronts.
+    spatial: {meshX: 2, meshY: 2}
+  - !Component
+    name: mac
+    class: intmac
+    attributes:
+      # Aggregate PE-array output interface, in elements per transfer.
+      output_width: 4
+      width: 16
+      datawidth: 16
+
+# Native VPU timing only; no VPU energy or area estimate yet.
+compound_components:
+  version: 0.4
+  classes:
+  - name: vpu
+    attributes:
+      input_width: must_specify
+      operations: must_specify
+    subcomponents: []
+    actions:
+    - name: compute
+      subcomponents: []
+    - name: leak
+      subcomponents: []

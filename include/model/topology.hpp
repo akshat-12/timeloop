@@ -39,6 +39,7 @@ algorithmic contributors may be used tactual or promote products derived
 #include "mapping/mapping.hpp"
 #include "model/level.hpp"
 #include "model/arithmetic.hpp"
+#include "model/vpu.hpp" // Separate optional VPU, not a replacement MAC level.
 #include "model/buffer.hpp"
 #include "compound-config/compound-config.hpp"
 #include "network.hpp"
@@ -127,30 +128,37 @@ class Topology : public Module
     unsigned arithmetic_map;
 
    public:
-    // Constructors and assignment operators.
-    Specs() = default;
-    ~Specs() = default;
+     // Value members preserve VPU configuration when mapper copies specs.
+     VPU::Specs vpu;
+     std::uint64_t pe_output_width = 0;
+     // Constructors and assignment operators.
+     Specs() = default;
+     ~Specs() = default;
 
-    // We need an explicit deep-copy constructor because of shared_ptrs.
-    Specs(const Specs& other)
-    {
-      for (auto& level_p: other.levels)
-        levels.push_back(level_p->Clone());
+     // We need an explicit deep-copy constructor because of shared_ptrs.
+     Specs(const Specs& other)
+     {
+       for (auto& level_p : other.levels)
+         levels.push_back(level_p->Clone());
 
-      for (auto& inferred_network_p: other.inferred_networks)
-        inferred_networks.push_back(std::make_shared<LegacyNetwork::Specs>(*inferred_network_p));
+       for (auto& inferred_network_p : other.inferred_networks)
+         inferred_networks.push_back(std::make_shared<LegacyNetwork::Specs>(*inferred_network_p));
 
-      for (auto& network_p: other.networks)
-        networks.push_back(network_p->Clone());
+       for (auto& network_p : other.networks)
+         networks.push_back(network_p->Clone());
 
-      storage_map = other.storage_map;
-      arithmetic_map = other.arithmetic_map;
-    }
+       vpu = other.vpu;
+       pe_output_width = other.pe_output_width;
+       storage_map = other.storage_map;
+       arithmetic_map = other.arithmetic_map;
+     }
 
     // Copy-and-swap idiom.
     friend void swap(Specs& first, Specs& second)
     {
       using std::swap;
+      swap(first.vpu, second.vpu);
+      swap(first.pe_output_width, second.pe_output_width);
       swap(first.levels, second.levels);
       swap(first.inferred_networks, second.inferred_networks);
       swap(first.networks, second.networks);
@@ -194,6 +202,9 @@ class Topology : public Module
   //
   struct Stats
   {
+    // Connected-path stats and original Timeloop latency for comparison.
+    VPU::Stats vpu;
+    std::uint64_t base_cycles = 0;
     double energy;
     double area;
     std::uint64_t cycles;
@@ -213,6 +224,8 @@ class Topology : public Module
 
     void Reset()
     {
+      vpu = VPU::Stats{};
+      base_cycles = 0;
       energy = 0;
       area = 0;
       cycles = 0;
@@ -273,6 +286,7 @@ class Topology : public Module
 
   void FloorPlan();
   void ComputeStats(bool eval_success);
+  void EvaluateVPU(const Mapping& mapping); // Completed-tile integration.
 
   /** @note Non-const getters to deal with fxns that depend on non-const outputs
    *  for the above fxns based on the below approach: 
