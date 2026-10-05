@@ -1680,8 +1680,57 @@ std::vector<EvalStatus> Topology::Evaluate(Mapping& mapping,
   return eval_status;
 }
 
-// Derive complete tiles and route costs from a dense Timeloop mapping.
-// This is a tile-level analytical schedule, not a value or instruction simulator.
+// Build the timing model for completed PE output tiles followed by a VPU stage.
+// Ordinary Timeloop evaluation must already have populated producer and memory
+// statistics. This function models work and transfers, not numerical tensor values.
+//
+// Step by step:
+// 1. Validate the workload stage against the architecture: the VPU name and
+//    interface widths must match, binary operations require a finite scalar,
+//    and only softmax may specify a vector length other than one. Identify the
+//    writable output tensor that the VPU will process.
+//
+// 2. Locate the connected shared buffer and its immediately enclosing, outermost
+//    DRAM. Require dense memories with matching word widths, one writable output,
+//    and a base mapping that keeps all tensors at both levels. Final-output
+//    routing is accounted for separately rather than through mapping bypasses.
+//
+// 3. Determine the dimensions of one completed shared-buffer tile. Multiply loop
+//    extents through the buffer boundary and allow only temporal output tiling
+//    outside it. Reductions must finish inside the tile, so the VPU receives final
+//    results rather than partial sums. Reject flattened problems, complex output
+//    projections, non-unit strides, and residual tiles unsupported by this model.
+//
+// 4. Project the tile and full problem onto the output tensor to obtain output
+//    elements per tile and the number of equal tiles. For softmax, require its
+//    vector length to match the last tile axis and divide the VPU input width.
+//
+// 5. Read baseline access counts. Require no output reads from DRAM and one final
+//    DRAM update per output element. Accumulate input reads and buffer traffic,
+//    and reserve a complete working set for every configured buffer slot. The
+//    reservation uses the larger of projected tile size and baseline utilized
+//    capacity for each tensor, including outputs on direct routes.
+//
+// 6. Apply routing and bandwidth assumptions. Direct PE input removes only final
+//    output-buffer updates; partial-sum updates remain. Convert words to cycles
+//    by rounding up at the applicable bandwidth. Shared bandwidth caps each
+//    direction; the scheduler later enforces contention. Producer cycles are the
+//    maximum across arithmetic and storage levels below the shared buffer.
+//
+// 7. Build eight phase costs per tile: prefetch, PE read, PE compute, PE write,
+//    VPU load, VPU compute, VPU write, and optional buffer-to-DRAM drain. Divide
+//    aggregate producer work and traffic among tiles, assigning remainders to
+//    early tiles. VPU compute uses rounded-up batch count times batch latency;
+//    direct input transfers one batch per cycle, and output uses the same width.
+//
+// 8. Pass phase costs to VPU::Schedule to account for dependencies, overlap,
+//    resource contention, and buffer-slot lifetimes. Store its result in
+//    stats_.vpu, then add tile dimensions, reserved capacity, and route-specific
+//    logical-word counts. ComputeStats later uses this schedule for total latency;
+//    energy, area, and ordinary access statistics remain baseline-only.
+//
+// Unsupported configurations and arithmetic overflow raise exceptions; the
+// enclosing Evaluate call reports these as evaluation failures.
 void Topology::EvaluateVPU(const Mapping& mapping)
 {
   using U = VPU::U;
