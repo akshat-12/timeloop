@@ -1675,159 +1675,271 @@ std::vector<EvalStatus> Topology::Evaluate(Mapping& mapping,
 void Topology::EvaluateVPU(const Mapping& mapping)
 {
   using U = VPU::U;
-  const auto& cfg = specs_.vpu;
+  const auto& vpu_specs = specs_.vpu;
   const auto& stage = workload_->vpu_stage;
-  if (!cfg.enabled || stage.unit != cfg.name)
+  // Validate the requested operation against the hardware. Scalars are checked
+  // for validity only: this model predicts timing, not numerical results.
+  if (!vpu_specs.enabled || stage.unit != vpu_specs.name)
     throw std::invalid_argument("VPU stage unit does not match architecture");
-  VPU::Validate(cfg, specs_.pe_output_width);
-  bool binary = stage.operation == "add" || stage.operation == "sub" || stage.operation == "mul";
-  if (binary != stage.has_scalar || (stage.has_scalar && !std::isfinite(stage.scalar)))
-    throw std::invalid_argument(
-        "add/sub/mul require a finite scalar; activations do not accept scalar");
+  VPU::Validate(vpu_specs, specs_.pe_output_width);
+  bool is_binary_operation = stage.operation == "add"
+                             || stage.operation == "sub"
+                             || stage.operation == "mul";
+  if (is_binary_operation != stage.has_scalar
+      || (stage.has_scalar && !std::isfinite(stage.scalar)))
+    throw std::invalid_argument("add/sub/mul require a finite scalar; "
+                                "activations do not accept scalar");
   if (stage.operation != "softmax" && stage.vector_length != 1)
     throw std::invalid_argument("Only softmax takes vector_length");
   const auto* shape = workload_->GetShape();
   if (shape->UsesFlattening)
     throw std::invalid_argument("VPU requires dense unflattened problems");
-  auto named = shape->DataSpaceNameToID.find(stage.output);
-  if (named == shape->DataSpaceNameToID.end() || !shape->IsReadWriteDataSpace.at(named->second))
+  auto output_entry = shape->DataSpaceNameToID.find(stage.output);
+  if (output_entry == shape->DataSpaceNameToID.end()
+      || !shape->IsReadWriteDataSpace.at(output_entry->second))
     throw std::invalid_argument("VPU output must be writable PE result");
-  auto pv = named->second;
+  auto output_id = output_entry->second;
+
+  // Locate the buffer/DRAM pair used by the pipeline. Start from a mapping
+  // that keeps every tensor here; direct routes adjust final-output traffic
+  // below.
   unsigned buffer_id = 0;
-  while (buffer_id < NumStorageLevels() &&
-         specs_.GetStorageLevel(buffer_id)->name.Get() != cfg.buffer)
+  while (buffer_id < NumStorageLevels()
+         && specs_.GetStorageLevel(buffer_id)->name.Get() != vpu_specs.buffer)
     ++buffer_id;
-  if (buffer_id + 2 != NumStorageLevels() ||
-      specs_.GetStorageLevel(buffer_id + 1)->name.Get() != cfg.dram)
-    throw std::invalid_argument("VPU shared buffer must be immediately below outermost named DRAM");
-  auto buffer = specs_.GetStorageLevel(buffer_id), dram = specs_.GetStorageLevel(buffer_id + 1);
+  if (buffer_id + 2 != NumStorageLevels()
+      || specs_.GetStorageLevel(buffer_id + 1)->name.Get() != vpu_specs.dram)
+    throw std::invalid_argument(
+        "VPU shared buffer must be immediately below outermost named DRAM");
+  auto buffer = specs_.GetStorageLevel(buffer_id),
+       dram = specs_.GetStorageLevel(buffer_id + 1);
   auto masks = tiling::TransposeMasks(mapping.datatype_bypass_nest, workload_);
   for (unsigned d = 0; d < shape->NumDataSpaces; ++d)
-  {
-    if (!masks.at(buffer_id).at(d) || !masks.at(buffer_id + 1).at(d))
-      throw std::invalid_argument("Base mapping must keep all tensors at buffer and DRAM; VPU "
-                                  "routing overrides final-output transfers");
-    if (d != pv && shape->IsReadWriteDataSpace.at(d))
-      throw std::invalid_argument("VPU supports one writable output");
-  }
-  if (buffer->is_sparse_module.Get() || dram->is_sparse_module.Get() ||
-      buffer->word_bits.Get() != dram->word_bits.Get())
-    throw std::invalid_argument("VPU requires dense memories with equal word widths");
-  // Complete reductions must stay inside each shared-buffer tile.
+    {
+      if (!masks.at(buffer_id).at(d) || !masks.at(buffer_id + 1).at(d))
+        throw std::invalid_argument(
+            "Base mapping must keep all tensors at buffer and DRAM; VPU "
+            "routing overrides final-output transfers");
+      if (d != output_id && shape->IsReadWriteDataSpace.at(d))
+        throw std::invalid_argument("VPU supports one writable output");
+    }
+  if (buffer->is_sparse_module.Get() || dram->is_sparse_module.Get()
+      || buffer->word_bits.Get() != dram->word_bits.Get())
+    throw std::invalid_argument(
+        "VPU requires dense memories with equal word widths");
+
+  // Identify output axes so we can distinguish output tiling from reduction
+  // tiling. Each projection must select one distinct axis with coefficient
+  // one. Complete reductions must stay inside each shared-buffer tile.
   std::set<unsigned> output_dims;
-  unsigned last_dim = 0;
-  for (const auto& projection : shape->Projections.at(pv))
-  {
-    if (projection.size() != 1 || (projection.front().first != shape->NumCoefficients &&
-                                   workload_->GetCoefficient(projection.front().first) != 1))
-      throw std::invalid_argument("VPU requires simple output projections");
-    last_dim = shape->FactorizedToFlattened.at(projection.front().second);
-    if (!output_dims.insert(last_dim).second)
-      throw std::invalid_argument("VPU repeated output axis");
-  }
+  unsigned last_output_dim = 0;
+  for (const auto& projection : shape->Projections.at(output_id))
+    {
+      if (projection.size() != 1
+          || (projection.front().first != shape->NumCoefficients
+              && workload_->GetCoefficient(projection.front().first) != 1))
+        throw std::invalid_argument("VPU requires simple output projections");
+      last_output_dim
+          = shape->FactorizedToFlattened.at(projection.front().second);
+      if (!output_dims.insert(last_output_dim).second)
+        throw std::invalid_argument("VPU repeated output axis");
+    }
   if (output_dims.empty())
     throw std::invalid_argument("VPU requires non-scalar output");
-  std::vector<U> extents(shape->NumFlattenedDimensions, 1);
-  auto boundary = mapping.loop_nest.storage_tiling_boundaries.at(buffer_id);
+
+  // Loops through the buffer boundary define one tile. Nontrivial outer loops
+  // may only visit output tiles sequentially; an outer reduction would leave
+  // partial results, and outer spatial loops are unsupported by this
+  // scheduler.
+  std::vector<U> tile_extents(shape->NumFlattenedDimensions, 1);
+  auto buffer_boundary
+      = mapping.loop_nest.storage_tiling_boundaries.at(buffer_id);
   for (unsigned i = 0; i < mapping.loop_nest.loops.size(); ++i)
-  {
-    const auto& loop = mapping.loop_nest.loops[i];
-    if (loop.start != 0 || loop.stride != 1 || loop.end <= 0 || loop.residual_end != loop.end)
-      throw std::invalid_argument("VPU requires perfect unit-stride tiles");
-    if (i <= boundary)
-      extents[loop.dimension] = VPU::Mul(extents[loop.dimension], loop.end);
-    else if (loop.end > 1 &&
-             (!output_dims.count(loop.dimension) || loop::IsSpatial(loop.spacetime_dimension)))
-      throw std::invalid_argument("VPU requires complete reductions and temporal outer tiles");
-  }
-  problem::OperationPoint low, high, full_high;
-  for (unsigned d = 0; d < extents.size(); ++d)
-  {
-    low[d] = 0;
-    high[d] = extents[d] - 1;
-    full_high[d] = workload_->GetFlattenedBound(d) - 1;
-  }
-  problem::OperationSpace piece(workload_, low, high), full(workload_, low, full_high);
-  U elements = piece.GetSize(pv), outputs = full.GetSize(pv);
-  if (!elements || outputs % elements)
+    {
+      const auto& loop = mapping.loop_nest.loops[i];
+      if (loop.start != 0 || loop.stride != 1 || loop.end <= 0
+          || loop.residual_end != loop.end)
+        throw std::invalid_argument("VPU requires perfect unit-stride tiles");
+      if (i <= buffer_boundary)
+        tile_extents[loop.dimension]
+            = VPU::Mul(tile_extents[loop.dimension], loop.end);
+      else if (loop.end > 1
+               && (!output_dims.count(loop.dimension)
+                   || loop::IsSpatial(loop.spacetime_dimension)))
+        throw std::invalid_argument(
+            "VPU requires complete reductions and temporal outer tiles");
+    }
+
+  // Project the tile and whole problem onto the output tensor to count
+  // elements. OperationSpace bounds are inclusive, hence the subtraction of
+  // one.
+  problem::OperationPoint low, tile_high, full_high;
+  for (unsigned d = 0; d < tile_extents.size(); ++d)
+    {
+      low[d] = 0;
+      tile_high[d] = tile_extents[d] - 1;
+      full_high[d] = workload_->GetFlattenedBound(d) - 1;
+    }
+  problem::OperationSpace tile_space(workload_, low, tile_high),
+      full_space(workload_, low, full_high);
+  U tile_output_elements = tile_space.GetSize(output_id),
+    total_output_elements = full_space.GetSize(output_id);
+  if (!tile_output_elements || total_output_elements % tile_output_elements)
     throw std::invalid_argument("VPU requires equal completed output tiles");
-  if (stage.operation == "softmax" &&
-      (stage.vector_length != extents[last_dim] || cfg.input_width % stage.vector_length))
+  // A softmax vector cannot cross tile or batch boundaries.
+  if (stage.operation == "softmax"
+      && (stage.vector_length != tile_extents[last_output_dim]
+          || vpu_specs.input_width % stage.vector_length))
+    throw std::invalid_argument("Softmax must cover the complete last tile "
+                                "axis and fit whole vectors in input_width");
+  U num_tiles = total_output_elements / tile_output_elements;
+
+  // Reuse ordinary Timeloop access counts. Require final outputs to reach DRAM
+  // once without reading spilled partial results back from DRAM.
+  const auto& buffer_stats = GetStorageLevel(buffer_id)->GetStats();
+  const auto& dram_stats = GetStorageLevel(buffer_id + 1)->GetStats();
+  if (dram_stats.reads.at(output_id) != 0
+      || dram_stats.updates.at(output_id) != total_output_elements
+      || buffer_stats.updates.at(output_id) < total_output_elements)
     throw std::invalid_argument(
-        "Softmax must cover the complete last tile axis and fit whole vectors in input_width");
-  U tiles = outputs / elements;
-  const auto& bs = GetStorageLevel(buffer_id)->GetStats();
-  const auto& ds = GetStorageLevel(buffer_id + 1)->GetStats();
-  if (ds.reads.at(pv) != 0 || ds.updates.at(pv) != outputs || bs.updates.at(pv) < outputs)
-    throw std::invalid_argument("VPU requires one final DRAM write, no partial DRAM reads, and "
-                                "final buffer updates in the base mapping");
-  U inputs = 0, reads = 0, writes = 0, working_set = 0;
+        "VPU requires one final DRAM write, no partial DRAM reads, and "
+        "final buffer updates in the base mapping");
+  U input_read_words = 0, buffer_read_words = 0, buffer_write_words = 0,
+    tile_working_set_words = 0;
   for (unsigned d = 0; d < shape->NumDataSpaces; ++d)
-  {
-    if (d != pv)
-      inputs = VPU::Add(inputs, ds.reads.at(d));
-    reads = VPU::Add(reads, bs.reads.at(d));
-    writes = VPU::Add(writes, bs.updates.at(d));
-    working_set = VPU::Add(working_set, std::max<U>(piece.GetSize(d), bs.utilized_capacity.at(d)));
-  }
-  if (!working_set || !buffer->effective_size.IsSpecified() ||
-      cfg.buffer_slots > buffer->effective_size.Get() / working_set)
-    throw std::invalid_argument("VPU buffer_slots exceed shared buffer capacity");
-  bool direct_in = cfg.input_source == "pe", direct_out = cfg.output_destination == "dram";
+    {
+      if (d != output_id)
+        input_read_words = VPU::Add(input_read_words, dram_stats.reads.at(d));
+      buffer_read_words
+          = VPU::Add(buffer_read_words, buffer_stats.reads.at(d));
+      buffer_write_words
+          = VPU::Add(buffer_write_words, buffer_stats.updates.at(d));
+      // Reserve at least the projected tile size and the baseline utilized
+      // capacity for each tensor, including the output even when a direct
+      // route is selected.
+      tile_working_set_words
+          = VPU::Add(tile_working_set_words,
+                     std::max<U>(tile_space.GetSize(d),
+                                 buffer_stats.utilized_capacity.at(d)));
+    }
+  // Each live tile occupies a full working set. Divide instead of multiplying
+  // to check capacity without overflowing. Slots remain live until DRAM
+  // delivery.
+  if (!tile_working_set_words || !buffer->effective_size.IsSpecified()
+      || vpu_specs.buffer_slots
+             > buffer->effective_size.Get() / tile_working_set_words)
+    throw std::invalid_argument(
+        "VPU buffer_slots exceed shared buffer capacity");
+  bool direct_pe_input = vpu_specs.input_source == "pe",
+       direct_dram_output = vpu_specs.output_destination == "dram";
   // Remove only the final output update. Earlier partial-sum traffic remains.
-  if (direct_in)
-    writes -= outputs;
-  auto rate = [](const BufferLevel::Specs& memory, bool read)
-  {
-    const auto& attr = read ? memory.read_bandwidth : memory.write_bandwidth;
-    double value = attr.IsSpecified() ? attr.Get() : 0;
-    if (memory.shared_bandwidth.IsSpecified() && memory.shared_bandwidth.Get() > 0)
-      value = value > 0 ? std::min(value, memory.shared_bandwidth.Get())
-                        : memory.shared_bandwidth.Get();
-    if (!std::isfinite(value) || value <= 0)
-      throw std::invalid_argument("VPU requires positive memory bandwidths");
-    return value;
-  };
-  auto transfer = [](U words, double bandwidth) -> U
-  {
-    long double cycles = std::ceil(static_cast<long double>(words) / bandwidth);
-    if (cycles >= static_cast<long double>(std::numeric_limits<U>::max()))
-      throw std::overflow_error("VPU transfer overflow");
-    return static_cast<U>(cycles);
-  };
-  double br = rate(*buffer, true), bw = rate(*buffer, false), dr = rate(*dram, true),
-         dw = rate(*dram, false);
-  U producer = GetArithmeticLevel()->Cycles();
+  if (direct_pe_input)
+    buffer_write_words -= total_output_elements;
+
+  // Bandwidths are words per cycle. A shared bandwidth caps either direction;
+  // Schedule() separately enforces contention between reads and writes.
+  auto memory_bandwidth = [](const BufferLevel::Specs& memory, bool read)
+    {
+      const auto& attr = read ? memory.read_bandwidth : memory.write_bandwidth;
+      double value = attr.IsSpecified() ? attr.Get() : 0;
+      if (memory.shared_bandwidth.IsSpecified()
+          && memory.shared_bandwidth.Get() > 0)
+        value = value > 0 ? std::min(value, memory.shared_bandwidth.Get())
+                          : memory.shared_bandwidth.Get();
+      if (!std::isfinite(value) || value <= 0)
+        throw std::invalid_argument("VPU requires positive memory bandwidths");
+      return value;
+    };
+  auto transfer_cycles = [](U words, double bandwidth) -> U
+    {
+      long double cycles
+          = std::ceil(static_cast<long double>(words) / bandwidth);
+      if (cycles >= static_cast<long double>(std::numeric_limits<U>::max()))
+        throw std::overflow_error("VPU transfer overflow");
+      return static_cast<U>(cycles);
+    };
+  double buffer_read_bandwidth = memory_bandwidth(*buffer, true),
+         buffer_write_bandwidth = memory_bandwidth(*buffer, false),
+         dram_read_bandwidth = memory_bandwidth(*dram, true),
+         dram_write_bandwidth = memory_bandwidth(*dram, false);
+
+  // The producer cost covers arithmetic and storage below the shared buffer.
+  // Buffer/DRAM transfers are modeled explicitly in the phases below.
+  U producer_cycles = GetArithmeticLevel()->Cycles();
   for (unsigned i = 0; i < buffer_id; ++i)
-    producer = std::max(producer, GetStorageLevel(i)->Cycles());
-  U compute = VPU::Cycles(cfg, stage.operation, elements);
-  std::vector<std::array<U, 8>> costs;
-  for (U tile = 0; tile < tiles; ++tile)
-  {
-    // Preserve aggregate producer work when splitting it among equal tiles.
-    // Any indivisible remainder is assigned one unit at a time to early tiles.
-    auto share = [&](U total) { return total / tiles + (tile < total % tiles); };
-    // Direct link transmits one input_width batch per cycle. VPU output
-    // width is assumed equal to input width; memory ports can limit either route.
-    costs.push_back(
-        {{transfer(share(inputs), std::min(dr, bw)), transfer(share(reads), br), share(producer),
-          transfer(share(writes), bw),
-          direct_in ? VPU::Batches(elements, cfg.input_width)
-                    : transfer(elements, std::min(br, double(cfg.input_width))),
-          compute, transfer(elements, std::min(direct_out ? dw : bw, double(cfg.input_width))),
-          direct_out ? 0 : transfer(elements, std::min(br, dw))}});
-  }
-  stats_.vpu = VPU::Schedule(
-      cfg, costs, buffer->shared_bandwidth.IsSpecified() && buffer->shared_bandwidth.Get() > 0);
-  auto& v = stats_.vpu;
-  v.elements = elements;
-  v.batches = VPU::Batches(elements, cfg.input_width);
-  v.reserved_words = VPU::Mul(working_set, cfg.buffer_slots);
-  v.pe_final_write_words = direct_in ? 0 : outputs;
-  v.vpu_read_words = direct_in ? 0 : outputs;
-  v.vpu_write_words = direct_out ? 0 : outputs;
-  v.drain_read_words = direct_out ? 0 : outputs;
-  v.dram_write_words = outputs;
+    producer_cycles = std::max(producer_cycles, GetStorageLevel(i)->Cycles());
+  U vpu_compute_cycles
+      = VPU::Cycles(vpu_specs, stage.operation, tile_output_elements);
+  std::vector<std::array<U, 8>> tile_costs;
+  for (U tile = 0; tile < num_tiles; ++tile)
+    {
+      // Preserve aggregate producer work when splitting it among equal tiles.
+      // Any indivisible remainder is assigned one unit at a time to early
+      // tiles.
+      auto tile_share = [&](U total)
+        { return total / num_tiles + (tile < total % num_tiles); };
+      // Direct link transmits one input_width batch per cycle. VPU output
+      // width is assumed equal to input width; memory ports can limit either
+      // route. Keep the eight entries in the order expected by VPU::Schedule.
+      tile_costs.push_back(
+          { { // 0: Prefetch input tensors from DRAM into the shared buffer.
+              transfer_cycles(
+                  tile_share(input_read_words),
+                  std::min(dram_read_bandwidth, buffer_write_bandwidth)),
+              // 1: Read the producer's operands and partial sums from the
+              // buffer.
+              transfer_cycles(tile_share(buffer_read_words),
+                              buffer_read_bandwidth),
+              // 2: Execute this tile's share of producer work.
+              tile_share(producer_cycles),
+              // 3: Write producer updates (excluding final outputs for direct
+              // PE input).
+              transfer_cycles(tile_share(buffer_write_words),
+                              buffer_write_bandwidth),
+              // 4: Load the VPU through the direct PE link or the buffer read
+              // port.
+              direct_pe_input
+                  ? VPU::Batches(tile_output_elements, vpu_specs.input_width)
+                  : transfer_cycles(tile_output_elements,
+                                    std::min(buffer_read_bandwidth,
+                                             double(vpu_specs.input_width))),
+              // 5: Process all batches, with no overlap between VPU batches.
+              vpu_compute_cycles,
+              // 6: Write VPU results to the selected destination.
+              transfer_cycles(tile_output_elements,
+                              std::min(direct_dram_output
+                                           ? dram_write_bandwidth
+                                           : buffer_write_bandwidth,
+                                       double(vpu_specs.input_width))),
+              // 7: Drain buffered results to DRAM; direct DRAM output already
+              // finished.
+              direct_dram_output
+                  ? 0
+                  : transfer_cycles(tile_output_elements,
+                                    std::min(buffer_read_bandwidth,
+                                             dram_write_bandwidth)) } });
+    }
+
+  // Phase costs describe service time; the scheduler derives elapsed time by
+  // enforcing dependencies, resource contention and the bounded tile slots.
+  stats_.vpu = VPU::Schedule(vpu_specs, tile_costs,
+                             buffer->shared_bandwidth.IsSpecified()
+                                 && buffer->shared_bandwidth.Get() > 0);
+
+  // Report logical words for the selected route separately from baseline
+  // access statistics. Energy and area are not recomputed for these extra
+  // transfers.
+  auto& vpu_stats = stats_.vpu;
+  vpu_stats.elements = tile_output_elements;
+  vpu_stats.batches
+      = VPU::Batches(tile_output_elements, vpu_specs.input_width);
+  vpu_stats.reserved_words
+      = VPU::Mul(tile_working_set_words, vpu_specs.buffer_slots);
+  vpu_stats.pe_final_write_words = direct_pe_input ? 0 : total_output_elements;
+  vpu_stats.vpu_read_words = direct_pe_input ? 0 : total_output_elements;
+  vpu_stats.vpu_write_words = direct_dram_output ? 0 : total_output_elements;
+  vpu_stats.drain_read_words = direct_dram_output ? 0 : total_output_elements;
+  vpu_stats.dram_write_words = total_output_elements;
 }
 
 void Topology::ComputeStats(bool eval_success)
