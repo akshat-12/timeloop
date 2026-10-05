@@ -8,22 +8,27 @@ vpu_route:
 # The runner adjusts outer M/N and inner K for the selected problem.
 # All four configurations use identical compute placement and tiling.
 mapping:
+
 - target: DRAM
   type: temporal
   factors: [M=16, N=16, K=1]
   permutation: [K, N, M]
+
 - target: DRAM
   type: dataspace
   keep: [A, B, C]
   bypass: []
+
 - target: shared_buffer
   type: temporal
   factors: [M=8, N=8, K=1024]
   permutation: [K, N, M]
+
 - target: shared_buffer
   type: dataspace
   keep: [A, B, C]
   bypass: []
+
 - target: PE
   type: spatial
   factors: [M=8, N=8, K=1]

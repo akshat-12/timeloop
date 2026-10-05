@@ -5,18 +5,23 @@ problem:
     name: matmul
     dimensions: [M, N, K]
     data_spaces:
+
     - name: A
       projection: [[[M]], [[K]]]
+
     - name: B
       projection: [[[K]], [[N]]]
+
     - name: C
       projection: [[[M]], [[N]]]
       read_write: true
+
   instance:
     M: 4
     N: 4
     K: 4
   # Activate native ReLU processing for each completed C tile.
+
   vpu_stages:
   - unit: VPU
     operation: relu

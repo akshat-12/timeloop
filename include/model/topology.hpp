@@ -128,9 +128,11 @@ class Topology : public Module
     unsigned arithmetic_map;
 
    public:
+
      // Value members preserve VPU configuration when mapper copies specs.
      VPU::Specs vpu;
      std::uint64_t pe_output_width = 0;
+
      // Constructors and assignment operators.
      Specs() = default;
      ~Specs() = default;
@@ -149,6 +151,7 @@ class Topology : public Module
 
        vpu = other.vpu;
        pe_output_width = other.pe_output_width;
+
        storage_map = other.storage_map;
        arithmetic_map = other.arithmetic_map;
      }
@@ -159,6 +162,7 @@ class Topology : public Module
       using std::swap;
       swap(first.vpu, second.vpu);
       swap(first.pe_output_width, second.pe_output_width);
+
       swap(first.levels, second.levels);
       swap(first.inferred_networks, second.inferred_networks);
       swap(first.networks, second.networks);
@@ -205,6 +209,7 @@ class Topology : public Module
     // Connected-path stats and original Timeloop latency for comparison.
     VPU::Stats vpu;
     std::uint64_t base_cycles = 0;
+
     double energy;
     double area;
     std::uint64_t cycles;
@@ -226,6 +231,7 @@ class Topology : public Module
     {
       vpu = VPU::Stats{};
       base_cycles = 0;
+
       energy = 0;
       area = 0;
       cycles = 0;

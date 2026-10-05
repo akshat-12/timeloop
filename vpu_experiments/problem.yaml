@@ -5,14 +5,19 @@ problem:
     name: matmul
     dimensions: [M, N, K]
     data_spaces:
+
     - name: A
       projection: [[[M]], [[K]]]
+
     - name: B
       projection: [[[K]], [[N]]]
+
     - name: C
       projection: [[[M]], [[N]]]
       read_write: true
+
   instance: {M: 1024, N: 1024, K: 1024}
+
   vpu_stages:
   - unit: VPU
     operation: relu

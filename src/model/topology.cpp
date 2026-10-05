@@ -105,7 +105,6 @@ void Topology::Specs::ParseAccelergyART(config::CompoundConfigNode art)
   }
 }
 
-
 void Topology::Specs::ParseAccelergyERT(config::CompoundConfigNode ert)
 {
   // std::cout << "Replacing energy numbers..." << std::endl;
@@ -425,6 +424,7 @@ std::ostream& operator << (std::ostream& out, const Topology& topology)
       out << '\n';
     }
   }
+
   out << "Networks" << std::endl;
   out << "--------" << std::endl;
 
@@ -730,7 +730,6 @@ void Topology::PrintOrojenesis(problem::Workload* workload_, std::ostream &out, 
         }
       }
     }
-
 
     out << "," << mapping.PrintCompact();
     if (log_mappings_yaml)
@@ -1149,31 +1148,40 @@ Topology::Specs Topology::ParseTreeSpecs(config::CompoundConfigNode designRoot, 
         {
           if (specs.vpu.enabled || nElements != 1)
             throw std::invalid_argument("Require exactly one shared VPU");
+
           auto attrs = curLocal[c].lookup("attributes");
           auto& v = specs.vpu;
           v.enabled = true;
           v.name = cName.substr(0, cName.find('['));
+
           auto positive = [](config::CompoundConfigNode node, const char* key) -> std::uint64_t
           {
             long long value = 0;
             if (!node.lookupValue(key, value) || value <= 0)
               throw std::invalid_argument(std::string("VPU requires positive ") + key);
+
             return value;
           };
+
           if (attrs.exists("instances") && positive(attrs, "instances") != 1)
             throw std::invalid_argument("VPU instances must be one");
+
           v.input_width = positive(attrs, "input_width");
           if (attrs.exists("buffer_slots"))
             v.buffer_slots = positive(attrs, "buffer_slots");
+
           attrs.lookupValue("input_source", v.input_source);
           attrs.lookupValue("output_destination", v.output_destination);
           attrs.lookupValue("connected_buffer", v.buffer);
           attrs.lookupValue("backing_storage", v.dram);
+
           if (!attrs.exists("operations") || !attrs.lookup("operations").isMap())
             throw std::invalid_argument("VPU requires operations mapping");
+
           auto ops = attrs.lookup("operations");
           std::vector<std::string> names;
           ops.getMapKeys(names);
+
           for (const auto& name : names)
             v.latencies[name] = positive(ops.lookup(name), "latency");
         }
@@ -1199,8 +1207,10 @@ Topology::Specs Topology::ParseTreeSpecs(config::CompoundConfigNode designRoot, 
             long long width = 0;
             if (!attrs.lookupValue("output_width", width) || width <= 0)
               throw std::invalid_argument("PE output_width must be positive");
+
             specs.pe_output_width = width;
           }
+
           // Create arithmetic.
           auto level_specs_p = std::make_shared<ArithmeticUnits::Specs>(ArithmeticUnits::ParseSpecs(curLocal[c], nElements, is_sparse_topology));
           specs.AddLevel(0, std::static_pointer_cast<LevelSpecs>(level_specs_p));
@@ -1243,6 +1253,7 @@ Topology::Specs Topology::ParseTreeSpecs(config::CompoundConfigNode designRoot, 
   // Reject mismatched ports even when no stage is enabled.
   if (specs.vpu.enabled)
     VPU::Validate(specs.vpu, specs.pe_output_width);
+
   return specs;
 };
 
@@ -1368,7 +1379,6 @@ std::vector<EvalStatus> Topology::PreEvaluationCheck(const Mapping& mapping,
   return eval_status;
 }
 
-
 std::vector<EvalStatus> Topology::Evaluate(Mapping& mapping,
                                            analysis::NestAnalysis* analysis,
                                            sparse::SparseOptimizationInfo* sparse_optimizations,
@@ -1440,7 +1450,6 @@ std::vector<EvalStatus> Topology::Evaluate(Mapping& mapping,
     return eval_status;
   }
 
-
   // Ugh... FIXME.
   auto compute_cycles = analysis->GetComputeInfo()[0].accesses; //innermost level
 
@@ -1457,7 +1466,6 @@ std::vector<EvalStatus> Topology::Evaluate(Mapping& mapping,
       }
     }
   }
-
 
   // Collapse tiles into a specified number of tiling levels. The solutions are
   // received in a set of per-problem::Shape::DataSpaceID arrays.
@@ -1649,6 +1657,7 @@ std::vector<EvalStatus> Topology::Evaluate(Mapping& mapping,
     {
       if (analysis->IsLayoutInitialized())
         throw std::invalid_argument("VPU requires bandwidth-based memory modeling");
+
       EvaluateVPU(mapping);
     }
     catch (const std::exception& e)
@@ -1657,6 +1666,7 @@ std::vector<EvalStatus> Topology::Evaluate(Mapping& mapping,
       eval_status.at(specs_.ArithmeticMap()) = {false, e.what()};
     }
   }
+
   if (!break_on_failure || success_accum)
   {
     ComputeStats(success_accum);
@@ -1677,11 +1687,14 @@ void Topology::EvaluateVPU(const Mapping& mapping)
   using U = VPU::U;
   const auto& vpu_specs = specs_.vpu;
   const auto& stage = workload_->vpu_stage;
+
   // Validate the requested operation against the hardware. Scalars are checked
   // for validity only: this model predicts timing, not numerical results.
   if (!vpu_specs.enabled || stage.unit != vpu_specs.name)
     throw std::invalid_argument("VPU stage unit does not match architecture");
+
   VPU::Validate(vpu_specs, specs_.pe_output_width);
+
   bool is_binary_operation = stage.operation == "add"
                              || stage.operation == "sub"
                              || stage.operation == "mul";
@@ -1689,15 +1702,19 @@ void Topology::EvaluateVPU(const Mapping& mapping)
       || (stage.has_scalar && !std::isfinite(stage.scalar)))
     throw std::invalid_argument("add/sub/mul require a finite scalar; "
                                 "activations do not accept scalar");
+
   if (stage.operation != "softmax" && stage.vector_length != 1)
     throw std::invalid_argument("Only softmax takes vector_length");
+
   const auto* shape = workload_->GetShape();
   if (shape->UsesFlattening)
     throw std::invalid_argument("VPU requires dense unflattened problems");
+
   auto output_entry = shape->DataSpaceNameToID.find(stage.output);
   if (output_entry == shape->DataSpaceNameToID.end()
       || !shape->IsReadWriteDataSpace.at(output_entry->second))
     throw std::invalid_argument("VPU output must be writable PE result");
+
   auto output_id = output_entry->second;
 
   // Locate the buffer/DRAM pair used by the pipeline. Start from a mapping
@@ -1706,11 +1723,13 @@ void Topology::EvaluateVPU(const Mapping& mapping)
   unsigned buffer_id = 0;
   while (buffer_id < NumStorageLevels()
          && specs_.GetStorageLevel(buffer_id)->name.Get() != vpu_specs.buffer)
+
     ++buffer_id;
   if (buffer_id + 2 != NumStorageLevels()
       || specs_.GetStorageLevel(buffer_id + 1)->name.Get() != vpu_specs.dram)
     throw std::invalid_argument(
         "VPU shared buffer must be immediately below outermost named DRAM");
+
   auto buffer = specs_.GetStorageLevel(buffer_id),
        dram = specs_.GetStorageLevel(buffer_id + 1);
   auto masks = tiling::TransposeMasks(mapping.datatype_bypass_nest, workload_);
@@ -1720,9 +1739,11 @@ void Topology::EvaluateVPU(const Mapping& mapping)
         throw std::invalid_argument(
             "Base mapping must keep all tensors at buffer and DRAM; VPU "
             "routing overrides final-output transfers");
+
       if (d != output_id && shape->IsReadWriteDataSpace.at(d))
         throw std::invalid_argument("VPU supports one writable output");
     }
+
   if (buffer->is_sparse_module.Get() || dram->is_sparse_module.Get()
       || buffer->word_bits.Get() != dram->word_bits.Get())
     throw std::invalid_argument(
@@ -1739,11 +1760,13 @@ void Topology::EvaluateVPU(const Mapping& mapping)
           || (projection.front().first != shape->NumCoefficients
               && workload_->GetCoefficient(projection.front().first) != 1))
         throw std::invalid_argument("VPU requires simple output projections");
+
       last_output_dim
           = shape->FactorizedToFlattened.at(projection.front().second);
       if (!output_dims.insert(last_output_dim).second)
         throw std::invalid_argument("VPU repeated output axis");
     }
+
   if (output_dims.empty())
     throw std::invalid_argument("VPU requires non-scalar output");
 
@@ -1760,6 +1783,7 @@ void Topology::EvaluateVPU(const Mapping& mapping)
       if (loop.start != 0 || loop.stride != 1 || loop.end <= 0
           || loop.residual_end != loop.end)
         throw std::invalid_argument("VPU requires perfect unit-stride tiles");
+
       if (i <= buffer_boundary)
         tile_extents[loop.dimension]
             = VPU::Mul(tile_extents[loop.dimension], loop.end);
@@ -1780,18 +1804,21 @@ void Topology::EvaluateVPU(const Mapping& mapping)
       tile_high[d] = tile_extents[d] - 1;
       full_high[d] = workload_->GetFlattenedBound(d) - 1;
     }
+
   problem::OperationSpace tile_space(workload_, low, tile_high),
       full_space(workload_, low, full_high);
   U tile_output_elements = tile_space.GetSize(output_id),
     total_output_elements = full_space.GetSize(output_id);
   if (!tile_output_elements || total_output_elements % tile_output_elements)
     throw std::invalid_argument("VPU requires equal completed output tiles");
+
   // A softmax vector cannot cross tile or batch boundaries.
   if (stage.operation == "softmax"
       && (stage.vector_length != tile_extents[last_output_dim]
           || vpu_specs.input_width % stage.vector_length))
     throw std::invalid_argument("Softmax must cover the complete last tile "
                                 "axis and fit whole vectors in input_width");
+
   U num_tiles = total_output_elements / tile_output_elements;
 
   // Reuse ordinary Timeloop access counts. Require final outputs to reach DRAM
@@ -1804,6 +1831,7 @@ void Topology::EvaluateVPU(const Mapping& mapping)
     throw std::invalid_argument(
         "VPU requires one final DRAM write, no partial DRAM reads, and "
         "final buffer updates in the base mapping");
+
   U input_read_words = 0, buffer_read_words = 0, buffer_write_words = 0,
     tile_working_set_words = 0;
   for (unsigned d = 0; d < shape->NumDataSpaces; ++d)
@@ -1814,6 +1842,7 @@ void Topology::EvaluateVPU(const Mapping& mapping)
           = VPU::Add(buffer_read_words, buffer_stats.reads.at(d));
       buffer_write_words
           = VPU::Add(buffer_write_words, buffer_stats.updates.at(d));
+
       // Reserve at least the projected tile size and the baseline utilized
       // capacity for each tensor, including the output even when a direct
       // route is selected.
@@ -1822,6 +1851,7 @@ void Topology::EvaluateVPU(const Mapping& mapping)
                      std::max<U>(tile_space.GetSize(d),
                                  buffer_stats.utilized_capacity.at(d)));
     }
+
   // Each live tile occupies a full working set. Divide instead of multiplying
   // to check capacity without overflowing. Slots remain live until DRAM
   // delivery.
@@ -1830,8 +1860,10 @@ void Topology::EvaluateVPU(const Mapping& mapping)
              > buffer->effective_size.Get() / tile_working_set_words)
     throw std::invalid_argument(
         "VPU buffer_slots exceed shared buffer capacity");
+
   bool direct_pe_input = vpu_specs.input_source == "pe",
        direct_dram_output = vpu_specs.output_destination == "dram";
+
   // Remove only the final output update. Earlier partial-sum traffic remains.
   if (direct_pe_input)
     buffer_write_words -= total_output_elements;
@@ -1848,16 +1880,20 @@ void Topology::EvaluateVPU(const Mapping& mapping)
                           : memory.shared_bandwidth.Get();
       if (!std::isfinite(value) || value <= 0)
         throw std::invalid_argument("VPU requires positive memory bandwidths");
+
       return value;
     };
+
   auto transfer_cycles = [](U words, double bandwidth) -> U
     {
       long double cycles
           = std::ceil(static_cast<long double>(words) / bandwidth);
       if (cycles >= static_cast<long double>(std::numeric_limits<U>::max()))
         throw std::overflow_error("VPU transfer overflow");
+
       return static_cast<U>(cycles);
     };
+
   double buffer_read_bandwidth = memory_bandwidth(*buffer, true),
          buffer_write_bandwidth = memory_bandwidth(*buffer, false),
          dram_read_bandwidth = memory_bandwidth(*dram, true),
@@ -1886,16 +1922,20 @@ void Topology::EvaluateVPU(const Mapping& mapping)
               transfer_cycles(
                   tile_share(input_read_words),
                   std::min(dram_read_bandwidth, buffer_write_bandwidth)),
+
               // 1: Read the producer's operands and partial sums from the
               // buffer.
               transfer_cycles(tile_share(buffer_read_words),
                               buffer_read_bandwidth),
+
               // 2: Execute this tile's share of producer work.
               tile_share(producer_cycles),
+
               // 3: Write producer updates (excluding final outputs for direct
               // PE input).
               transfer_cycles(tile_share(buffer_write_words),
                               buffer_write_bandwidth),
+
               // 4: Load the VPU through the direct PE link or the buffer read
               // port.
               direct_pe_input
@@ -1903,14 +1943,17 @@ void Topology::EvaluateVPU(const Mapping& mapping)
                   : transfer_cycles(tile_output_elements,
                                     std::min(buffer_read_bandwidth,
                                              double(vpu_specs.input_width))),
+
               // 5: Process all batches, with no overlap between VPU batches.
               vpu_compute_cycles,
+
               // 6: Write VPU results to the selected destination.
               transfer_cycles(tile_output_elements,
                               std::min(direct_dram_output
                                            ? dram_write_bandwidth
                                            : buffer_write_bandwidth,
                                        double(vpu_specs.input_width))),
+
               // 7: Drain buffered results to DRAM; direct DRAM output already
               // finished.
               direct_dram_output

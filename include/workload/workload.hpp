@@ -81,14 +81,18 @@ class Workload
   friend const Shape* GetShape();
 
  public:
+
    // A single post-matmul stage; binary operations use a supplied scalar.
    struct VPUStage
    {
      bool enabled = false, has_scalar = false;
+
      std::string unit, operation, output;
+
      double scalar = 0;
      std::uint64_t vector_length = 1;
    } vpu_stage;
+
   Workload() {
     workload_alive_ = true;
     current_shape_ = &shape_;

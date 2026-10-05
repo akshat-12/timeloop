@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Run the local YAML inputs using PyTimeloop and the adjacent native build."""
+
 import os
 from pathlib import Path
 import sys
@@ -9,6 +10,7 @@ BUILD = HERE.parent / "build"
 
 # Use matching native binaries and libraries; the loader reads this at startup.
 os.environ["PATH"] = str(BUILD) + os.pathsep + os.environ.get("PATH", "")
+
 if os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)[0] != str(BUILD):
     os.environ["LD_LIBRARY_PATH"] = (
         str(BUILD) + os.pathsep + os.environ.get("LD_LIBRARY_PATH", "")
@@ -23,4 +25,5 @@ if __name__ == "__main__":
         str(HERE / "problem.yaml"),
         str(HERE / "mapping.yaml"),
     )
+
     tl.call_model(spec, output_dir=str(HERE / "outputs"))

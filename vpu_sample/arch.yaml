@@ -1,9 +1,11 @@
 architecture:
   version: 0.4
   nodes:
+
   - !Container
     name: system
     attributes: {technology: "45nm", global_cycle_seconds: 1e-9}
+
   - !Component
     name: DRAM
     class: DRAM
@@ -14,6 +16,7 @@ architecture:
       block_size: 1
       read_bandwidth: 4
       write_bandwidth: 4
+
   - !Component
     name: shared_buffer
     class: SRAM
@@ -24,6 +27,7 @@ architecture:
       block_size: 1
       read_bandwidth: 4
       write_bandwidth: 4
+
   - !Component
     # One VPU, independently configurable final-output input/output routes.
     name: VPU
@@ -37,6 +41,7 @@ architecture:
       connected_buffer: "shared_buffer"
       backing_storage: "DRAM"
       buffer_slots: 2
+
       # Latency per batch of up to input_width elements; batches are serial.
       operations:
         add: {latency: 1}
@@ -46,10 +51,12 @@ architecture:
         sigmoid: {latency: 16}
         tanh: {latency: 24}
         softmax: {latency: 64}
+
   - !Container
     name: PE
     # 2x2 MAC array; Timeloop models mapped compute, not systolic wavefronts.
     spatial: {meshX: 2, meshY: 2}
+
   - !Component
     name: mac
     class: intmac
@@ -63,13 +70,16 @@ architecture:
 compound_components:
   version: 0.4
   classes:
+
   - name: vpu
     attributes:
       input_width: must_specify
       operations: must_specify
     subcomponents: []
     actions:
+
     - name: compute
       subcomponents: []
+
     - name: leak
       subcomponents: []
