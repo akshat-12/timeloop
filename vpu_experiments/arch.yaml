@@ -1,3 +1,4 @@
+# Fixed hardware for fair comparisons: 64 PEs, 16-bit words, 2 MiB shared buffer.
 architecture:
   version: 0.4
   nodes:
@@ -8,22 +9,22 @@ architecture:
     name: DRAM
     class: DRAM
     attributes:
-      depth: 1024
+      depth: 16777216
       width: 16
       datawidth: 16
       block_size: 1
-      read_bandwidth: 4
-      write_bandwidth: 4
+      read_bandwidth: 32
+      write_bandwidth: 32
   - !Component
     name: shared_buffer
     class: SRAM
     attributes:
-      depth: 64
+      depth: 1048576
       width: 16
       datawidth: 16
       block_size: 1
-      read_bandwidth: 4
-      write_bandwidth: 4
+      read_bandwidth: 64
+      write_bandwidth: 64
   - !Component
     # One VPU, independently configurable final-output input/output routes.
     name: VPU
@@ -31,7 +32,7 @@ architecture:
     subclass: vpu
     attributes:
       instances: 1
-      input_width: 4
+      input_width: 64
       input_source: "shared_buffer" # "pe" selects a direct PE-to-VPU link.
       output_destination: "shared_buffer" # "dram" skips the final buffer round trip.
       connected_buffer: "shared_buffer"
@@ -48,14 +49,14 @@ architecture:
         softmax: {latency: 64}
   - !Container
     name: PE
-    # 2x2 MAC array; Timeloop models mapped compute, not systolic wavefronts.
-    spatial: {meshX: 2, meshY: 2}
+    # 8x8 MAC array; Timeloop models mapped compute, not systolic wavefronts.
+    spatial: {meshX: 8, meshY: 8}
   - !Component
     name: mac
     class: intmac
     attributes:
       # Aggregate PE-array output interface, in elements per transfer.
-      output_width: 4
+      output_width: 64
       width: 16
       datawidth: 16
 

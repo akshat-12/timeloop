@@ -1,0 +1,19 @@
+# A[1024,1024] x B[1024,1024] -> C[1024,1024]; 1,073,741,824 MAC operations.
+problem:
+  version: 0.4
+  shape:
+    name: matmul
+    dimensions: [M, N, K]
+    data_spaces:
+    - name: A
+      projection: [[[M]], [[K]]]
+    - name: B
+      projection: [[[K]], [[N]]]
+    - name: C
+      projection: [[[M]], [[N]]]
+      read_write: true
+  instance: {M: 1024, N: 1024, K: 1024}
+  vpu_stages:
+  - unit: VPU
+    operation: relu
+    output: C
