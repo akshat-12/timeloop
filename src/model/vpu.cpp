@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 namespace model
 {
@@ -39,10 +40,9 @@ VPU::U VPU::Batches(U n, U w)
 
 void VPU::Validate(const Specs& s, U pe_width)
 {
-  if (!s.input_width || !s.buffer_slots || s.input_width != pe_width)
+  if (!s.input_width || s.input_width != pe_width)
     throw std::invalid_argument(
-        "PE output_width must equal positive VPU input_width; buffer_slots must be positive");
-
+        "PE output_width must equal positive VPU input_width");
   if (s.input_source != "pe" && s.input_source != "shared_buffer")
     throw std::invalid_argument("VPU input_source must be pe or shared_buffer");
 
@@ -68,215 +68,6 @@ VPU::U VPU::Cycles(const Specs& s, const std::string& op, U elements)
   // Deliberately no internal pipelining: one batch finishes before the next starts.
 
   return Mul(Batches(elements, s.input_width), it->second);
-}
-
-// Schedule a bounded pipeline from precomputed per-tile phase durations.
-// Each tile_costs entry has eight cycle counts in the order documented below.
-// Architecture/mapping validation and cost derivation belong to EvaluateVPU;
-// this function places that work in time and returns timing statistics and a trace.
-//
-// Step by step:
-// 1. Require at least one buffer slot and initialize each slot as available at
-//    cycle zero. A slot represents a complete tile working set and remains held
-//    until that tile's final output reaches DRAM, limiting how far prefetch can run.
-//
-// 2. Create a reservation calendar for each resource, plus PE and VPU availability
-//    times. Resource intervals are [start, finish): another event may start exactly
-//    when one finishes. Unit availability also includes handoff/write stalls that
-//    extend beyond the unit's compute phase.
-//
-// 3. For each event, begin at its dependency-ready time and find an interval free
-//    on every required resource. If any reservation conflicts, move past it and
-//    check all resources again before committing the interval. Whole tiles are
-//    scheduled in order, but their events may overlap: a later tile can fill gaps
-//    before an earlier tile's future reservations. Zero-duration phases reserve
-//    nothing while still propagating their dependency time.
-//
-// 4. For memory transfers, reserve the selected buffer read/write port and, when
-//    has_shared_buffer_port is true, the common buffer resource as well. Transfers
-//    involving DRAM also reserve a single shared DMA resource. Direct VPU-to-DRAM
-//    output uses DMA without occupying a buffer port.
-//
-// 5. Schedule producer phases 0-3 for each tile: prefetch after its round-robin
-//    buffer slot is available, read after both prefetch and PE release, compute
-//    after the read, and write after compute. Prefetch can overlap earlier tiles
-//    when the required resources and slot are free.
-//
-// 6. Schedule phase 4, the VPU load, after the producer write and previous VPU
-//    output write. Direct PE input occupies the PE-output/VPU-input interfaces
-//    and delays PE release until handoff finishes. Buffered input uses a buffer
-//    read and releases the PE as soon as its own buffer write finishes.
-//
-// 7. Schedule phases 5-6: VPU compute followed by output to the buffer or DRAM.
-//    The VPU may accept its next tile only after this output transfer completes.
-//    For buffered output, phase 7 drains results to DRAM; direct output needs no
-//    drain. Release the tile's buffer slot only after the chosen route reaches
-//    DRAM, although the next VPU tile may proceed while a buffered drain runs.
-//
-// 8. Return the largest event finish time as elapsed pipeline cycles and the sum
-//    of phase durations as serial cycles for the same work. Also accumulate VPU
-//    compute/output-write service times and retain the first 256 nonzero events
-//    in scheduling order. The trace limit does not truncate the actual schedule.
-//    EvaluateVPU fills in element counts, capacity, and traffic counters afterward.
-VPU::Stats VPU::Schedule(const Specs& specs, const std::vector<std::array<U, 8>>& tile_costs,
-                         bool has_shared_buffer_port)
-{
-  if (!specs.buffer_slots)
-    throw std::invalid_argument("VPU buffer_slots must be positive");
-
-  Stats stats;
-  stats.active = true;
-  stats.tiles = tile_costs.size();
-
-  // Each slot records when its previous tile has finished writing to DRAM.
-  // Reserving complete tile lifetimes prevents unlimited prefetching.
-  std::vector<U> slot_available_at(specs.buffer_slots, 0);
-
-  // Resource calendars store non-overlapping [start, finish) intervals.
-  std::map<std::string, std::map<U, U>> resource_reservations;
-
-  // These track when each unit may accept its next tile, including handoff
-  // and output-write stalls that extend beyond its compute phase.
-  U pe_available_at = 0, vpu_available_at = 0;
-
-  // Find the earliest interval that is free on every required resource.
-  // Entire tiles are scheduled one at a time, so an earlier tile may already
-  // reserve a future interval. Later tiles can still fill gaps before it.
-  auto schedule_event = [&](U tile, const std::string& phase, U ready_at, U duration,
-                            std::vector<std::string> resources)
-  {
-    U start = ready_at;
-
-    // Zero-duration phases preserve dependency timing but reserve no resource.
-    if (duration)
-    {
-      for (;;)
-      {
-        U next_start = start;
-        for (const auto& resource : resources)
-        {
-          auto& reservations = resource_reservations[resource];
-          auto reservation = reservations.lower_bound(start);
-
-          // The preceding reservation may extend across our proposed start.
-          if (reservation != reservations.begin())
-            next_start = std::max(next_start, std::prev(reservation)->second);
-
-          // Later reservations can also conflict with the proposed duration.
-          for (; reservation != reservations.end() && reservation->first < Add(start, duration);
-               ++reservation)
-            next_start = std::max(next_start, reservation->second);
-        }
-
-        if (next_start == start)
-          break;
-
-        // Moving past a conflict can introduce a conflict on another resource;
-        // check all calendars again until the whole interval is available.
-        start = next_start;
-      }
-
-      // Commit only after finding a common gap. Intervals are half-open, so
-      // a resource can be reused at the exact cycle a previous event finishes.
-      for (const auto& resource : resources)
-        resource_reservations[resource].emplace(start, Add(start, duration));
-    }
-
-    U finish = Add(start, duration);
-
-    // Elapsed time includes overlap; serial time sums the same phase costs
-    // as if no two phases could overlap.
-    stats.total = std::max(stats.total, finish);
-    stats.serial = Add(stats.serial, duration);
-
-    // Bound report size without truncating the schedule or its cycle totals.
-    if (duration && stats.trace.size() < 256)
-      stats.trace.push_back({tile, start, finish, phase, resources});
-
-    return finish;
-  };
-
-  // Memory transfers share ports; DRAM reads and writes also share one DMA.
-  // A direct VPU-to-DRAM write uses DMA but does not occupy a buffer port.
-  auto schedule_transfer = [&](U tile, const std::string& phase, U ready_at, U duration,
-                               const std::string& buffer_port, bool uses_dma)
-  {
-    std::vector<std::string> resources;
-    if (!buffer_port.empty())
-    {
-      resources.push_back(buffer_port);
-      if (has_shared_buffer_port)
-        resources.push_back("buffer_shared");
-    }
-
-    if (uses_dma)
-      resources.push_back("dma");
-
-    return schedule_event(tile, phase, ready_at, duration, resources);
-  };
-
-  for (U tile = 0; tile < tile_costs.size(); ++tile)
-  {
-    // Phase order matches the cost array assembled by Topology::EvaluateVPU:
-    // prefetch, PE read, PE compute, PE write, VPU load, VPU compute,
-    // VPU output write, and optional buffer-to-DRAM drain.
-    const auto& phase_cycles = tile_costs[tile];
-
-    // Phases 0-3: wait for this slot, fetch operands, then run the producer.
-    // Prefetch may overlap previous tiles; PE reads wait for producer release.
-    auto prefetch_finish =
-        schedule_transfer(tile, "prefetch", slot_available_at[tile % specs.buffer_slots],
-                          phase_cycles[0], "buffer_write", true);
-    auto pe_read_finish =
-        schedule_transfer(tile, "pe_read", std::max(prefetch_finish, pe_available_at),
-                          phase_cycles[1], "buffer_read", false);
-    auto pe_compute_finish = schedule_event(tile, "pe", pe_read_finish, phase_cycles[2], {"pe"});
-    auto pe_write_finish = schedule_transfer(tile, "pe_write", pe_compute_finish, phase_cycles[3],
-                                             "buffer_write", false);
-
-    // Phase 4: input routing determines when the PE is released for its next tile.
-    // Both routes wait until the VPU has finished writing its previous result.
-    U vpu_load_finish;
-    if (specs.input_source == "pe")
-    {
-      // One completed output tile can stay at the PE; no unbounded hidden FIFO.
-      vpu_load_finish =
-          schedule_event(tile, "pe_to_vpu", std::max(pe_write_finish, vpu_available_at),
-                         phase_cycles[4], {"pe_output", "vpu_input"});
-
-      // Block the next PE tile until the current result has been accepted.
-      pe_available_at = vpu_load_finish;
-    }
-    else
-    {
-      vpu_load_finish =
-          schedule_transfer(tile, "vpu_read", std::max(pe_write_finish, vpu_available_at),
-                            phase_cycles[4], "buffer_read", false);
-
-      // Buffered results release the PE as soon as its buffer write completes.
-      pe_available_at = pe_write_finish;
-    }
-
-    // Phases 5-6: VPU compute is followed by output transfer. Keep the VPU
-    // unavailable until that write completes, even if its compute has finished.
-    auto vpu_compute_finish =
-        schedule_event(tile, "vpu", vpu_load_finish, phase_cycles[5], {"vpu"});
-    bool direct_dram_output = specs.output_destination == "dram";
-    vpu_available_at = schedule_transfer(
-        tile, direct_dram_output ? "vpu_to_dram" : "vpu_write", vpu_compute_finish, phase_cycles[6],
-        direct_dram_output ? "" : "buffer_write", direct_dram_output);
-
-    // Phase 7: buffered output needs a final drain; direct output is already
-    // in DRAM. Only then may a later tile reuse this slot and its working set.
-    slot_available_at[tile % specs.buffer_slots] =
-        direct_dram_output ? vpu_available_at
-                           : schedule_transfer(tile, "drain", vpu_available_at, phase_cycles[7],
-                                               "buffer_read", true);
-    stats.compute = Add(stats.compute, phase_cycles[5]);
-    stats.write = Add(stats.write, phase_cycles[6]);
-  }
-
-  return stats;
 }
 
 } // namespace model

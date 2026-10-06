@@ -396,7 +396,7 @@ std::ostream& operator << (std::ostream& out, const Topology& topology)
   {
     const auto& v = topology.stats_.vpu;
     const auto& cfg = topology.specs_.vpu;
-    out << "VPU pipeline\n"
+    out << "VPU throughput\n"
         << "  Input source: " << cfg.input_source << "\n"
         << "  Output destination: " << cfg.output_destination << "\n"
         << "  Matched interface width: " << cfg.input_width << "\n"
@@ -404,25 +404,20 @@ std::ostream& operator << (std::ostream& out, const Topology& topology)
         << "  Output elements per tile: " << v.elements << "\n"
         << "  Batches per tile: " << v.batches << "\n"
         << "  VPU compute cycles: " << v.compute << "\n"
-        << "  VPU output transfer cycles: " << v.write << "\n"
-        << "  Pipeline cycles: " << v.total << "\n"
-        << "  Same-work serial cycles: " << v.serial << "\n"
+        << "  Buffer-to-VPU cycles: " << v.buffer_to_vpu << "\n"
+        << "  PE-to-VPU cycles: " << v.pe_to_vpu << "\n"
+        << "  VPU-to-buffer cycles: " << v.vpu_to_buffer << "\n"
+        << "  VPU-to-DRAM cycles: " << v.vpu_to_dram << "\n"
+        << "  Adjusted buffer cycles: " << v.buffer_cycles << "\n"
+        << "  Adjusted DRAM cycles: " << v.dram_cycles << "\n"
+        << "  Throughput cycles: " << v.total << "\n"
         << "  Baseline cycles: " << topology.stats_.base_cycles << "\n"
-        << "  Reserved buffer words: " << v.reserved_words << "\n"
         << "  PE final buffer write words: " << v.pe_final_write_words << "\n"
         << "  VPU buffer read words: " << v.vpu_read_words << "\n"
         << "  VPU buffer write words: " << v.vpu_write_words << "\n"
         << "  Final buffer drain read words: " << v.drain_read_words << "\n"
         << "  Final DRAM write words: " << v.dram_write_words << "\n"
-        << "  Energy/area and ordinary access stats remain baseline-only.\n"
-        << "tile,phase,start,finish,resources (first 256 nonzero events)\n";
-    for (const auto& e : v.trace)
-    {
-      out << e.tile << ',' << e.phase << ',' << e.start << ',' << e.finish << ',';
-      for (const auto& r : e.resources)
-        out << r << ';';
-      out << '\n';
-    }
+        << "  Energy/area and ordinary access stats remain baseline-only.\n";
   }
 
   out << "Networks" << std::endl;
@@ -1167,9 +1162,6 @@ Topology::Specs Topology::ParseTreeSpecs(config::CompoundConfigNode designRoot, 
             throw std::invalid_argument("VPU instances must be one");
 
           v.input_width = positive(attrs, "input_width");
-          if (attrs.exists("buffer_slots"))
-            v.buffer_slots = positive(attrs, "buffer_slots");
-
           attrs.lookupValue("input_source", v.input_source);
           attrs.lookupValue("output_destination", v.output_destination);
           attrs.lookupValue("connected_buffer", v.buffer);
@@ -1680,57 +1672,8 @@ std::vector<EvalStatus> Topology::Evaluate(Mapping& mapping,
   return eval_status;
 }
 
-// Build the timing model for completed PE output tiles followed by a VPU stage.
-// Ordinary Timeloop evaluation must already have populated producer and memory
-// statistics. This function models work and transfers, not numerical tensor values.
-//
-// Step by step:
-// 1. Validate the workload stage against the architecture: the VPU name and
-//    interface widths must match, binary operations require a finite scalar,
-//    and only softmax may specify a vector length other than one. Identify the
-//    writable output tensor that the VPU will process.
-//
-// 2. Locate the connected shared buffer and its immediately enclosing, outermost
-//    DRAM. Require dense memories with matching word widths, one writable output,
-//    and a base mapping that keeps all tensors at both levels. Final-output
-//    routing is accounted for separately rather than through mapping bypasses.
-//
-// 3. Determine the dimensions of one completed shared-buffer tile. Multiply loop
-//    extents through the buffer boundary and allow only temporal output tiling
-//    outside it. Reductions must finish inside the tile, so the VPU receives final
-//    results rather than partial sums. Reject flattened problems, complex output
-//    projections, non-unit strides, and residual tiles unsupported by this model.
-//
-// 4. Project the tile and full problem onto the output tensor to obtain output
-//    elements per tile and the number of equal tiles. For softmax, require its
-//    vector length to match the last tile axis and divide the VPU input width.
-//
-// 5. Read baseline access counts. Require no output reads from DRAM and one final
-//    DRAM update per output element. Accumulate input reads and buffer traffic,
-//    and reserve a complete working set for every configured buffer slot. The
-//    reservation uses the larger of projected tile size and baseline utilized
-//    capacity for each tensor, including outputs on direct routes.
-//
-// 6. Apply routing and bandwidth assumptions. Direct PE input removes only final
-//    output-buffer updates; partial-sum updates remain. Convert words to cycles
-//    by rounding up at the applicable bandwidth. Shared bandwidth caps each
-//    direction; the scheduler later enforces contention. Producer cycles are the
-//    maximum across arithmetic and storage levels below the shared buffer.
-//
-// 7. Build eight phase costs per tile: prefetch, PE read, PE compute, PE write,
-//    VPU load, VPU compute, VPU write, and optional buffer-to-DRAM drain. Divide
-//    aggregate producer work and traffic among tiles, assigning remainders to
-//    early tiles. VPU compute uses rounded-up batch count times batch latency;
-//    direct input transfers one batch per cycle, and output uses the same width.
-//
-// 8. Pass phase costs to VPU::Schedule to account for dependencies, overlap,
-//    resource contention, and buffer-slot lifetimes. Store its result in
-//    stats_.vpu, then add tile dimensions, reserved capacity, and route-specific
-//    logical-word counts. ComputeStats later uses this schedule for total latency;
-//    energy, area, and ordinary access statistics remain baseline-only.
-//
-// Unsupported configurations and arithmetic overflow raise exceptions; the
-// enclosing Evaluate call reports these as evaluation failures.
+// Derive complete tiles and route costs from a dense Timeloop mapping.
+// Throughput bounds assume overlap; no startup/drain or tile scheduling.
 void Topology::EvaluateVPU(const Mapping& mapping)
 {
   using U = VPU::U;
@@ -1766,7 +1709,7 @@ void Topology::EvaluateVPU(const Mapping& mapping)
 
   auto output_id = output_entry->second;
 
-  // Locate the buffer/DRAM pair used by the pipeline. Start from a mapping
+  // Locate the buffer/DRAM pair used by the VPU. Start from a mapping
   // that keeps every tensor here; direct routes adjust final-output traffic
   // below.
   unsigned buffer_id = 0;
@@ -1822,7 +1765,7 @@ void Topology::EvaluateVPU(const Mapping& mapping)
   // Loops through the buffer boundary define one tile. Nontrivial outer loops
   // may only visit output tiles sequentially; an outer reduction would leave
   // partial results, and outer spatial loops are unsupported by this
-  // scheduler.
+  // model.
   std::vector<U> tile_extents(shape->NumFlattenedDimensions, 1);
   auto buffer_boundary
       = mapping.loop_nest.storage_tiling_boundaries.at(buffer_id);
@@ -1881,156 +1824,71 @@ void Topology::EvaluateVPU(const Mapping& mapping)
         "VPU requires one final DRAM write, no partial DRAM reads, and "
         "final buffer updates in the base mapping");
 
-  U input_read_words = 0, buffer_read_words = 0, buffer_write_words = 0,
-    tile_working_set_words = 0;
+  U reads = 0, writes = 0, dram_reads = 0, dram_writes = 0;
   for (unsigned d = 0; d < shape->NumDataSpaces; ++d)
-    {
-      if (d != output_id)
-        input_read_words = VPU::Add(input_read_words, dram_stats.reads.at(d));
-      buffer_read_words
-          = VPU::Add(buffer_read_words, buffer_stats.reads.at(d));
-      buffer_write_words
-          = VPU::Add(buffer_write_words, buffer_stats.updates.at(d));
-
-      // Reserve at least the projected tile size and the baseline utilized
-      // capacity for each tensor, including the output even when a direct
-      // route is selected.
-      tile_working_set_words
-          = VPU::Add(tile_working_set_words,
-                     std::max<U>(tile_space.GetSize(d),
-                                 buffer_stats.utilized_capacity.at(d)));
-    }
-
-  // Each live tile occupies a full working set. Divide instead of multiplying
-  // to check capacity without overflowing. Slots remain live until DRAM
-  // delivery.
-  if (!tile_working_set_words || !buffer->effective_size.IsSpecified()
-      || vpu_specs.buffer_slots
-             > buffer->effective_size.Get() / tile_working_set_words)
-    throw std::invalid_argument(
-        "VPU buffer_slots exceed shared buffer capacity");
-
-  bool direct_pe_input = vpu_specs.input_source == "pe",
-       direct_dram_output = vpu_specs.output_destination == "dram";
-
-  // Remove only the final output update. Earlier partial-sum traffic remains.
-  if (direct_pe_input)
-    buffer_write_words -= total_output_elements;
-
-  // Bandwidths are words per cycle. A shared bandwidth caps either direction;
-  // Schedule() separately enforces contention between reads and writes.
-  auto memory_bandwidth = [](const BufferLevel::Specs& memory, bool read)
-    {
-      const auto& attr = read ? memory.read_bandwidth : memory.write_bandwidth;
-      double value = attr.IsSpecified() ? attr.Get() : 0;
-      if (memory.shared_bandwidth.IsSpecified()
-          && memory.shared_bandwidth.Get() > 0)
-        value = value > 0 ? std::min(value, memory.shared_bandwidth.Get())
-                          : memory.shared_bandwidth.Get();
-      if (!std::isfinite(value) || value <= 0)
-        throw std::invalid_argument("VPU requires positive memory bandwidths");
-
-      return value;
-    };
-
-  auto transfer_cycles = [](U words, double bandwidth) -> U
-    {
-      long double cycles
-          = std::ceil(static_cast<long double>(words) / bandwidth);
-      if (cycles >= static_cast<long double>(std::numeric_limits<U>::max()))
-        throw std::overflow_error("VPU transfer overflow");
-
-      return static_cast<U>(cycles);
-    };
-
-  double buffer_read_bandwidth = memory_bandwidth(*buffer, true),
-         buffer_write_bandwidth = memory_bandwidth(*buffer, false),
-         dram_read_bandwidth = memory_bandwidth(*dram, true),
-         dram_write_bandwidth = memory_bandwidth(*dram, false);
-
-  // The producer cost covers arithmetic and storage below the shared buffer.
-  // Buffer/DRAM transfers are modeled explicitly in the phases below.
-  U producer_cycles = GetArithmeticLevel()->Cycles();
-  for (unsigned i = 0; i < buffer_id; ++i)
-    producer_cycles = std::max(producer_cycles, GetStorageLevel(i)->Cycles());
-  U vpu_compute_cycles
-      = VPU::Cycles(vpu_specs, stage.operation, tile_output_elements);
-  std::vector<std::array<U, 8>> tile_costs;
-  for (U tile = 0; tile < num_tiles; ++tile)
-    {
-      // Preserve aggregate producer work when splitting it among equal tiles.
-      // Any indivisible remainder is assigned one unit at a time to early
-      // tiles.
-      auto tile_share = [&](U total)
-        { return total / num_tiles + (tile < total % num_tiles); };
-      // Direct link transmits one input_width batch per cycle. VPU output
-      // width is assumed equal to input width; memory ports can limit either
-      // route. Keep the eight entries in the order expected by VPU::Schedule.
-      tile_costs.push_back(
-          { { // 0: Prefetch input tensors from DRAM into the shared buffer.
-              transfer_cycles(
-                  tile_share(input_read_words),
-                  std::min(dram_read_bandwidth, buffer_write_bandwidth)),
-
-              // 1: Read the producer's operands and partial sums from the
-              // buffer.
-              transfer_cycles(tile_share(buffer_read_words),
-                              buffer_read_bandwidth),
-
-              // 2: Execute this tile's share of producer work.
-              tile_share(producer_cycles),
-
-              // 3: Write producer updates (excluding final outputs for direct
-              // PE input).
-              transfer_cycles(tile_share(buffer_write_words),
-                              buffer_write_bandwidth),
-
-              // 4: Load the VPU through the direct PE link or the buffer read
-              // port.
-              direct_pe_input
-                  ? VPU::Batches(tile_output_elements, vpu_specs.input_width)
-                  : transfer_cycles(tile_output_elements,
-                                    std::min(buffer_read_bandwidth,
-                                             double(vpu_specs.input_width))),
-
-              // 5: Process all batches, with no overlap between VPU batches.
-              vpu_compute_cycles,
-
-              // 6: Write VPU results to the selected destination.
-              transfer_cycles(tile_output_elements,
-                              std::min(direct_dram_output
-                                           ? dram_write_bandwidth
-                                           : buffer_write_bandwidth,
-                                       double(vpu_specs.input_width))),
-
-              // 7: Drain buffered results to DRAM; direct DRAM output already
-              // finished.
-              direct_dram_output
-                  ? 0
-                  : transfer_cycles(tile_output_elements,
-                                    std::min(buffer_read_bandwidth,
-                                             dram_write_bandwidth)) } });
-    }
-
-  // Phase costs describe service time; the scheduler derives elapsed time by
-  // enforcing dependencies, resource contention and the bounded tile slots.
-  stats_.vpu = VPU::Schedule(vpu_specs, tile_costs,
-                             buffer->shared_bandwidth.IsSpecified()
-                                 && buffer->shared_bandwidth.Get() > 0);
-
-  // Report logical words for the selected route separately from baseline
-  // access statistics. Energy and area are not recomputed for these extra
-  // transfers.
+  {
+    reads = VPU::Add(reads, buffer_stats.reads.at(d));
+    writes = VPU::Add(writes, VPU::Add(buffer_stats.updates.at(d), buffer_stats.fills.at(d)));
+    dram_reads = VPU::Add(dram_reads, dram_stats.reads.at(d));
+    dram_writes = VPU::Add(dram_writes, VPU::Add(dram_stats.updates.at(d), dram_stats.fills.at(d)));
+  }
+  bool direct_in = vpu_specs.input_source == "pe", direct_out = vpu_specs.output_destination == "dram";
+  // Preserve baseline memory-access accounting; only final-output routing changes.
+  if (direct_in)
+    writes -= total_output_elements;
+  else
+    reads = VPU::Add(reads, total_output_elements);
+  if (!direct_out)
+    writes = VPU::Add(writes, total_output_elements);
+  auto rate = [](const BufferLevel::Specs& memory, bool read)
+  {
+    const auto& attr = read ? memory.read_bandwidth : memory.write_bandwidth;
+    double value = attr.IsSpecified() ? attr.Get() : 0;
+    if (memory.shared_bandwidth.IsSpecified() && memory.shared_bandwidth.Get() > 0)
+      value = value > 0 ? std::min(value, memory.shared_bandwidth.Get())
+                        : memory.shared_bandwidth.Get();
+    if (!std::isfinite(value) || value <= 0)
+      throw std::invalid_argument("VPU requires positive memory bandwidths");
+    return value;
+  };
+  auto transfer = [](U words, double bandwidth) -> U
+  {
+    long double cycles = std::ceil(static_cast<long double>(words) / bandwidth);
+    if (cycles >= static_cast<long double>(std::numeric_limits<U>::max()))
+      throw std::overflow_error("VPU transfer overflow");
+    return static_cast<U>(cycles);
+  };
+  double br = rate(*buffer, true), bw = rate(*buffer, false), dr = rate(*dram, true),
+         dw = rate(*dram, false);
+  auto memory_cycles = [&](const BufferLevel::Specs& memory, U r, U w,
+                           double read_rate, double write_rate)
+  {
+    U cycles = std::max(transfer(r, read_rate), transfer(w, write_rate));
+    if (memory.shared_bandwidth.IsSpecified() && memory.shared_bandwidth.Get() > 0)
+      cycles = std::max(cycles, transfer(VPU::Add(r, w), memory.shared_bandwidth.Get()));
+    return cycles;
+  };
   auto& vpu_stats = stats_.vpu;
+  vpu_stats = VPU::Stats{};
+  vpu_stats.active = true;
+  vpu_stats.tiles = num_tiles;
   vpu_stats.elements = tile_output_elements;
-  vpu_stats.batches
-      = VPU::Batches(tile_output_elements, vpu_specs.input_width);
-  vpu_stats.reserved_words
-      = VPU::Mul(tile_working_set_words, vpu_specs.buffer_slots);
-  vpu_stats.pe_final_write_words = direct_pe_input ? 0 : total_output_elements;
-  vpu_stats.vpu_read_words = direct_pe_input ? 0 : total_output_elements;
-  vpu_stats.vpu_write_words = direct_dram_output ? 0 : total_output_elements;
-  vpu_stats.drain_read_words = direct_dram_output ? 0 : total_output_elements;
+  vpu_stats.batches = VPU::Batches(tile_output_elements, vpu_specs.input_width);
+  vpu_stats.compute = VPU::Mul(num_tiles, VPU::Cycles(vpu_specs, stage.operation, tile_output_elements));
+  vpu_stats.buffer_to_vpu = direct_in ? 0 : transfer(total_output_elements, std::min(br, double(vpu_specs.input_width)));
+  vpu_stats.pe_to_vpu = direct_in ? VPU::Batches(total_output_elements, vpu_specs.input_width) : 0;
+  vpu_stats.vpu_to_buffer = direct_out ? 0 : transfer(total_output_elements, std::min(bw, double(vpu_specs.input_width)));
+  vpu_stats.vpu_to_dram = direct_out ? transfer(total_output_elements, std::min(dw, double(vpu_specs.input_width))) : 0;
+  vpu_stats.buffer_cycles = memory_cycles(*buffer, reads, writes, br, bw);
+  vpu_stats.dram_cycles = memory_cycles(*dram, dram_reads, dram_writes, dr, dw);
+  vpu_stats.total = std::max({GetArithmeticLevel()->Cycles(), vpu_stats.buffer_cycles, vpu_stats.dram_cycles,
+                      vpu_stats.buffer_to_vpu, vpu_stats.pe_to_vpu, vpu_stats.compute, vpu_stats.vpu_to_buffer, vpu_stats.vpu_to_dram});
+  for (unsigned i = 0; i < buffer_id; ++i)
+    vpu_stats.total = std::max(vpu_stats.total, GetStorageLevel(i)->Cycles());
+  vpu_stats.pe_final_write_words = direct_in ? 0 : total_output_elements;
+  vpu_stats.vpu_read_words = direct_in ? 0 : total_output_elements;
+  vpu_stats.vpu_write_words = direct_out ? 0 : total_output_elements;
+  vpu_stats.drain_read_words = direct_out ? 0 : total_output_elements;
   vpu_stats.dram_write_words = total_output_elements;
 }
 
@@ -2067,7 +1925,7 @@ void Topology::ComputeStats(bool eval_success)
     }
 
     // Max cycle plus network fill and drain latency
-    // The complete connected schedule replaces, rather than adds to, baseline latency.
+    // Route-adjusted throughput replaces baseline component timing.
     stats_.base_cycles = cycles + total_network_latency_;
     stats_.cycles = (stats_.vpu.active ? stats_.vpu.total : cycles) + total_network_latency_;
 

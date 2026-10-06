@@ -41,8 +41,6 @@ architecture:
       output_destination: "shared_buffer" # "dram" skips the final buffer round trip.
       connected_buffer: "shared_buffer"
       backing_storage: "DRAM"
-      buffer_slots: 2
-
       # Latency per batch of up to input_width elements; batches are serial.
       operations:
         add: {latency: 1}

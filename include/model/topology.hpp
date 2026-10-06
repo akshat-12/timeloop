@@ -206,7 +206,7 @@ class Topology : public Module
   //
   struct Stats
   {
-    // Connected-path stats and original Timeloop latency for comparison.
+    // VPU throughput bounds and original Timeloop latency for comparison.
     VPU::Stats vpu;
     std::uint64_t base_cycles = 0;
 
@@ -292,7 +292,7 @@ class Topology : public Module
 
   void FloorPlan();
   void ComputeStats(bool eval_success);
-  void EvaluateVPU(const Mapping& mapping); // Completed-tile integration.
+  void EvaluateVPU(const Mapping& mapping); // Aggregate route and memory throughput.
 
   /** @note Non-const getters to deal with fxns that depend on non-const outputs
    *  for the above fxns based on the below approach: 

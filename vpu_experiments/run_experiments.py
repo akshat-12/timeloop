@@ -164,17 +164,11 @@ def simulate(problem_path, operation, route_name, width, results, timeout):
     for label, value in expected.items():
         if metric(text, label) != value:
             raise RuntimeError(f"Incorrect {label} in {directory}")
-
-    if cycles != metric(text, "Pipeline cycles"):
+    if cycles != metric(text, "Throughput cycles"):
         raise RuntimeError("Unexpected network latency; revisit this experiment's assumptions")
-
-    if cycles > metric(text, "Same-work serial cycles"):
-        raise RuntimeError("Pipeline exceeds serial service time")
-
     return dict(problem=problem_path.stem, M=m, N=n, K=k, activation=operation,
                 route=route_name, input_width=width, latency_per_batch=latency,
                 cycles=cycles, vpu_compute_cycles=metric(text, "VPU compute cycles"),
-                serial_cycles=metric(text, "Same-work serial cycles"),
                 tiles=tiles, batches_per_tile=batches, run_directory=str(directory))
 
 def write_csv(path, rows):

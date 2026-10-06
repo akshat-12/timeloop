@@ -1,11 +1,8 @@
-// Simple batch VPU and bounded tile pipeline. All widths are elements.
+// Aggregate VPU throughput model. All widths are elements.
 #pragma once
-
-#include <array>
 #include <cstdint>
 #include <map>
 #include <string>
-#include <vector>
 
 namespace model
 {
@@ -26,19 +23,7 @@ public:
     std::string output_destination = "shared_buffer";
 
     U input_width = 0;  // Elements accepted per batch; must match the PE output width.
-    U buffer_slots = 2; // Maximum number of tile working sets alive simultaneously.
-
     std::map<std::string, U> latencies; // Cycles for one batch of each operation.
-  };
-
-  struct Event
-  {
-    U tile;
-    U start;
-    U finish; // Exclusive end: a resource can be reused at this cycle.
-
-    std::string phase;
-    std::vector<std::string> resources;
   };
 
   struct Stats
@@ -49,34 +34,29 @@ public:
     U elements = 0; // Output elements in one completed PE tile.
     U batches = 0;  // VPU batches per tile.
 
-    // Service times add all tiles' work; total measures elapsed time with overlap.
+    U buffer_to_vpu = 0;
+    U pe_to_vpu = 0;
     U compute = 0;
-    U write = 0;
-    U total = 0;
-    U serial = 0;
+    U vpu_to_buffer = 0;
+    U vpu_to_dram = 0;
+    U buffer_cycles = 0;
+    U dram_cycles = 0;
+    U total = 0; // Maximum resource/route cost; assumes full overlap.
 
     // Route-specific traffic counters count logical words, not bytes.
-    U reserved_words = 0;
     U pe_final_write_words = 0;
     U vpu_read_words = 0;
     U vpu_write_words = 0;
     U drain_read_words = 0;
     U dram_write_words = 0;
-
-    std::vector<Event> trace;
   };
 
-  // Checked arithmetic is shared by transfer, batch and schedule costs.
+  // Checked arithmetic for traffic and batch costs.
   static U Add(U a, U b);
   static U Mul(U a, U b);
   static U Batches(U elements, U width);
 
   static void Validate(const Specs& specs, U pe_output_width);
   static U Cycles(const Specs& specs, const std::string& operation, U elements);
-
-  // Eight phases: prefetch, PE read/compute/write, VPU read/compute/write, drain.
-  // Direct input holds the PE until handoff; output holds the VPU until its write finishes.
-  static Stats Schedule(const Specs& specs, const std::vector<std::array<U, 8>>& costs,
-                        bool shared_port);
 };
 } // namespace model
